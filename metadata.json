@@ -1,0 +1,6 @@
+{
+  "name": "PaletizaPro — Monitoramento de Paletização Industrial",
+  "description": "Painel web interativo para simulação e monitoramento em tempo real do processo de paletização industrial, controle de produção, detecção rápida de falhas e visualização de paletes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

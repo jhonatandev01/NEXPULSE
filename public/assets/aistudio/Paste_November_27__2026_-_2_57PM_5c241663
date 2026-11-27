@@ -1,0 +1,1258 @@
+
+Abaixo está a implementação completa de um backend industrial assíncrono, tolerante a falhas e de alta vazão para o sistema de monitoramento de paletização.
+Ele foi projetado com complexidade real de engenharia de produção (sem código genérico), resolvendo os problemas críticos de chão de fábrica: ingestão desacoplada com backpressure, máquina de estados determinística, detecção de anomalias na formação do palete, degradação preditiva de tempo de ciclo (EWMA), cálculo de OEE em tempo real, rastreabilidade ponta a ponta e fan-out via Redis + WebSockets.
+1. Arquitetura Interna do Backend
+Text
+MQTT Broker (Mosquitto/EMQX)
+      │  (QoS 1 / TLS / Store-and-Forward replay)
+      ▼
+[ MQTTIngestor ] ──(Validação Pydantic v2)──► [ asyncio.Queue (Backpressure) ]
+                                                        │
+                     ┌──────────────────────────────────┴──────────────────────────────────┐
+                     ▼ (Worker por Linha c/ Lock)                                          ▼
+          [ StateAndPalletEngine ]                                               [ BatchTimeseriesWriter ]
+           • Máquina de Estados (0..5)                                            • Micro-batches a cada 2s
+           • Microparada (<60s) vs Parada Macro                                     ou 50 registros no
+           • Detecção de Reset/Rollover de CLP                                      PostgreSQL / TimescaleDB
+           • Rastreio do Palete + Anomalia de Camada
+           • Alerta Preditivo de Ciclo (EWMA)
+                     │
+                     ├──────────────────► [ Redis Hot State + Pub/Sub ] ──► [ WebSocket Manager ] ──► Dashboards/Andons
+                     └──────────────────► [ PostgreSQL Relacional ] ◄────── [ FastAPI REST API (OEE, Pareto, Auditoria) ]
+2. Estrutura de Diretórios
+Text
+palletizing-backend/
+├── docker-compose.yml
+├── requirements.txt
+├── simulator.py                  # Simulador de CLP/Edge p/ testar falhas, camadas e OEE
+└── app/
+    ├── __init__.py
+    ├── main.py                   # Lifespan, FastAPI app, Prometheus metrics
+    ├── core/
+    │   └── config.py             # Configurações via Pydantic Settings
+    ├── db/
+    │   ├── session.py            # AsyncEngine, TimescaleDB hypertable init
+    │   └── models.py             # Modelos SQLAlchemy 2.0 (Receitas, Paletes, Paradas, Telemetria)
+    ├── schemas/
+    │   └── telemetry.py          # Contratos estritos Pydantic v2 (Entrada MQTT + Respostas API)
+    ├── services/
+    │   ├── state_engine.py       # Motor de Estados, Paradas, Paletes e EWMA
+    │   ├── oee_engine.py         # Motor analítico de OEE (Disp x Perf x Qual) e Pareto
+    │   └── mqtt_ingestor.py      # Consumidor MQTT resiliente + Batch Writer
+    └── api/
+        ├── ws.py                 # WebSocket Fan-out escalável via Redis Pub/Sub
+        └── routes.py             # Endpoints REST completos
+3. Infraestrutura e Dependências
+docker-compose.yml
+Yaml
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: industrial
+      POSTGRES_PASSWORD: strong_password
+      POSTGRES_DB: palletizing_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U industrial -d palletizing_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    command: mosquitto -c /mosquitto-no-auth.conf
+
+volumes:
+  pg_data:
+requirements.txt
+Text
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+pydantic==2.10.2
+pydantic-settings==2.6.1
+aiomqtt==2.3.0
+redis==5.2.0
+structlog==24.4.0
+prometheus-fastapi-instrumentator==7.0.0
+4. Núcleo de Configuração e Banco de Dados
+app/core/config.py
+Python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    APP_NAME: str = "Palletizing Industrial Backend"
+    DATABASE_URL: str = "postgresql+asyncpg://industrial:strong_password@localhost:5432/palletizing_db"
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    MQTT_HOST: str = "localhost"
+    MQTT_PORT: int = 1883
+    MQTT_TOPIC: str = "fabrica/+/+/telemetria"
+
+    # Regras de Engenharia Industrial
+    MICROSTOP_THRESHOLD_SEC: int = 60         # Abaixo disso = microparada; acima = exige justificativa
+    BATCH_FLUSH_INTERVAL_SEC: float = 2.0     # Intervalo de flush do TimescaleDB
+    BATCH_MAX_SIZE: int = 100                 # Tamanho máximo do micro-batch
+    EWMA_ALPHA: float = 0.2                   # Suavização exponencial do tempo de ciclo
+    CYCLE_DEGRADATION_FACTOR: float = 1.25    # Alerta se ciclo EWMA > 25% acima do nominal
+
+
+settings = Settings()
+app/db/models.py
+Python
+import enum
+from datetime import datetime
+from typing import Optional
+from sqlalchemy import (
+    BigInteger, Boolean, DateTime, Enum, Float, ForeignKey,
+    Index, Integer, JSON, String, Text, UniqueConstraint
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class MachineStateEnum(int, enum.Enum):
+    OFFLINE = 0
+    RUNNING = 1
+    WAITING_MATERIAL = 2
+    WAITING_UNLOAD = 3
+    SETUP = 4
+    FAULT = 5
+
+
+class PalletStatusEnum(str, enum.Enum):
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETE = "COMPLETE"
+    INCOMPLETE_ABORTED = "INCOMPLETE_ABORTED"
+    OVERCOUNT_ANOMALY = "OVERCOUNT_ANOMALY"
+
+
+class DowntimeTypeEnum(str, enum.Enum):
+    MICROSTOP = "MICROSTOP"
+    MACROSTOP = "MACROSTOP"
+    FAULT = "FAULT"
+
+
+class ProductRecipe(Base):
+    __tablename__ = "product_recipes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sku: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(150))
+    boxes_per_layer: Mapped[int] = mapped_column(Integer)
+    total_layers: Mapped[int] = mapped_column(Integer)
+    ideal_cycle_sec: Mapped[float] = mapped_column(Float)
+    stacking_pattern: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ReasonCode(Base):
+    __tablename__ = "reason_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True)
+    category: Mapped[str] = mapped_column(String(64))  # Mecânica, Elétrica, Logística, Operacional
+    description: Mapped[str] = mapped_column(String(200))
+    is_planned_stop: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class PalletRecord(Base):
+    __tablename__ = "pallet_records"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    line_id: Mapped[str] = mapped_column(String(64), index=True)
+    pallet_uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    sku: Mapped[str] = mapped_column(String(64), index=True)
+    target_boxes: Mapped[int] = mapped_column(Integer)
+    actual_boxes: Mapped[int] = mapped_column(Integer, default=0)
+    max_layer_reached: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[PalletStatusEnum] = mapped_column(Enum(PalletStatusEnum), default=PalletStatusEnum.IN_PROGRESS)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DowntimeEvent(Base):
+    __tablename__ = "downtime_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    line_id: Mapped[str] = mapped_column(String(64), index=True)
+    machine_state: Mapped[int] = mapped_column(Integer)
+    downtime_type: Mapped[DowntimeTypeEnum] = mapped_column(Enum(DowntimeTypeEnum))
+    alarm_code: Mapped[int] = mapped_column(Integer, default=0)
+    alarm_description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    reason_code_id: Mapped[Optional[int]] = mapped_column(ForeignKey("reason_codes.id"), nullable=True)
+    justified_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    justification_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_sec: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    reason: Mapped[Optional[ReasonCode]] = relationship()
+
+
+class AnomalyAlert(Base):
+    __tablename__ = "anomaly_alerts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    line_id: Mapped[str] = mapped_column(String(64), index=True)
+    alert_type: Mapped[str] = mapped_column(String(64), index=True)  # LAYER_OVERFLOW, CYCLE_DEGRADATION, etc.
+    severity: Mapped[str] = mapped_column(String(16))                # WARNING, CRITICAL
+    message: Mapped[str] = mapped_column(Text)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class TelemetryPoint(Base):
+    """Hypertable TimescaleDB particionada por tempo."""
+    __tablename__ = "telemetry_points"
+    __table_args__ = (
+        UniqueConstraint("line_id", "time", name="uq_telemetry_line_time"),
+        Index("ix_telemetry_line_time_desc", "line_id", "time"),
+    )
+
+    time: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    line_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    machine_state: Mapped[int] = mapped_column(Integer)
+    robot_status: Mapped[int] = mapped_column(Integer)
+    conveyor_in_ok: Mapped[bool] = mapped_column(Boolean)
+    conveyor_out_ok: Mapped[bool] = mapped_column(Boolean)
+    sku: Mapped[str] = mapped_column(String(64))
+    boxes_shift: Mapped[int] = mapped_column(Integer)
+    completed_pallets: Mapped[int] = mapped_column(Integer)
+    current_layer: Mapped[int] = mapped_column(Integer)
+    boxes_in_layer: Mapped[int] = mapped_column(Integer)
+    cycle_time_sec: Mapped[float] = mapped_column(Float)
+    ewma_cycle_sec: Mapped[float] = mapped_column(Float)
+    alarm_code: Mapped[int] = mapped_column(Integer)
+app/db/session.py
+Python
+import structlog
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from app.core.config import settings
+from app.db.models import Base
+
+logger = structlog.get_logger()
+
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    pool_size=20,
+    max_overflow=10,
+    pool_pre_ping=True,
+    echo=False,
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+async def init_db() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Ativa TimescaleDB Hypertable se disponível no Postgres
+        try:
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"))
+            await conn.execute(
+                text(
+                    "SELECT create_hypertable('telemetry_points', 'time', "
+                    "if_not_exists => TRUE, migrate_data => TRUE);"
+                )
+            )
+            logger.info("timescaledb_hypertable_ready")
+        except Exception as exc:
+            logger.warning("timescaledb_fallback_standard_postgres", reason=str(exc))
+
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+5. Contratos de Dados (Pydantic v2)
+app/schemas/telemetry.py
+Python
+from datetime import datetime, timezone
+from typing import Optional
+from pydantic import BaseModel, Field, field_validator
+
+
+class PLCTelemetryPayload(BaseModel):
+    line_id: str = Field(..., min_length=2, max_length=64)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    machine_state: int = Field(..., ge=0, le=5)
+    robot_status: int = Field(..., ge=0, le=5)
+    conveyor_in_ok: bool
+    conveyor_out_ok: bool
+    sku: str = Field(..., min_length=1, max_length=64)
+    boxes_shift: int = Field(..., ge=0)
+    completed_pallets: int = Field(..., ge=0)
+    current_layer: int = Field(..., ge=0)
+    boxes_in_layer: int = Field(..., ge=0)
+    cycle_time_sec: float = Field(..., ge=0.0, le=300.0)
+    alarm_code: int = Field(default=0, ge=0)
+    alarm_description: Optional[str] = None
+
+    @field_validator("timestamp")
+    @classmethod
+    def ensure_utc(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+
+
+class DowntimeJustifyRequest(BaseModel):
+    reason_code_id: int
+    justified_by: str = Field(..., min_length=2, max_length=100)
+    notes: Optional[str] = None
+
+
+class RecipeCreateRequest(BaseModel):
+    sku: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=2, max_length=150)
+    boxes_per_layer: int = Field(..., ge=1)
+    total_layers: int = Field(..., ge=1)
+    ideal_cycle_sec: float = Field(..., gt=0.1)
+    stacking_pattern: dict = Field(default_factory=dict)
+
+
+class OEEResponse(BaseModel):
+    line_id: str
+    window_start: datetime
+    window_end: datetime
+    availability: float
+    performance: float
+    quality: float
+    oee: float
+    total_boxes: int
+    total_pallets: int
+    planned_time_sec: float
+    running_time_sec: float
+    downtime_sec: float
+6. Motores de Regras Industriais
+app/services/state_engine.py
+Este é o cérebro operacional: mantém contexto isolado por line_id protegido por asyncio.Lock, trata rollover/reset de CLP, gerencia abertura/fechamento de paradas, detecta anomalias de formação do palete e calcula degradação preditiva de ciclo via EWMA.
+Python
+import asyncio
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, Optional
+import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.db.models import (
+    AnomalyAlert, DowntimeEvent, DowntimeTypeEnum, MachineStateEnum,
+    PalletRecord, PalletStatusEnum, ProductRecipe
+)
+from app.schemas.telemetry import PLCTelemetryPayload
+
+logger = structlog.get_logger()
+
+
+@dataclass
+class LineRuntimeContext:
+    last_payload: Optional[PLCTelemetryPayload] = None
+    open_downtime_id: Optional[int] = None
+    open_downtime_start: Optional[datetime] = None
+    active_pallet_id: Optional[int] = None
+    active_pallet_boxes: int = 0
+    ewma_cycle_sec: float = 0.0
+    degradation_streak: int = 0
+    last_alert_at: Optional[datetime] = None
+
+
+class StateAndPalletEngine:
+    def __init__(self) -> None:
+        self._contexts: Dict[str, LineRuntimeContext] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, line_id: str) -> asyncio.Lock:
+        if line_id not in self._locks:
+            self._locks[line_id] = asyncio.Lock()
+        return self._locks[line_id]
+
+    async def process_telemetry(
+        self, session: AsyncSession, payload: PLCTelemetryPayload
+    ) -> dict:
+        """
+        Processa telemetria com atomicidade por linha.
+        Retorna snapshot enriquecido para cache Redis e broadcast WebSocket.
+        """
+        lock = self._get_lock(payload.line_id)
+        async with lock:
+            ctx = self._contexts.setdefault(payload.line_id, LineRuntimeContext())
+            prev = ctx.last_payload
+
+            # Descarta pacotes fora de ordem (Store-and-Forward atrasado não corrompe estado atual)
+            if prev and payload.timestamp < prev.timestamp:
+                logger.warning(
+                    "out_of_order_telemetry_skipped",
+                    line_id=payload.line_id,
+                    msg_ts=payload.timestamp.isoformat(),
+                    last_ts=prev.timestamp.isoformat(),
+                )
+                return {}
+
+            recipe = await self._get_recipe(session, payload.sku)
+            target_boxes = (recipe.boxes_per_layer * recipe.total_layers) if recipe else 0
+
+            # 1. Máquina de Estados & Gestão de Paradas
+            await self._handle_state_transition(session, ctx, prev, payload)
+
+            # 2. Formação do Palete & Detecção de Erros de Contagem
+            await self._handle_pallet_tracking(session, ctx, prev, payload, recipe)
+
+            # 3. Análise Preditiva de Degradação do Tempo de Ciclo (EWMA)
+            await self._handle_cycle_ewma(session, ctx, payload, recipe)
+
+            ctx.last_payload = payload
+            await session.commit()
+
+            return {
+                "line_id": payload.line_id,
+                "timestamp": payload.timestamp.isoformat(),
+                "machine_state": payload.machine_state,
+                "machine_state_label": MachineStateEnum(payload.machine_state).name,
+                "robot_status": payload.robot_status,
+                "conveyor_in_ok": payload.conveyor_in_ok,
+                "conveyor_out_ok": payload.conveyor_out_ok,
+                "sku": payload.sku,
+                "boxes_shift": payload.boxes_shift,
+                "completed_pallets": payload.completed_pallets,
+                "current_layer": payload.current_layer,
+                "total_layers": recipe.total_layers if recipe else 0,
+                "boxes_in_layer": payload.boxes_in_layer,
+                "boxes_per_layer": recipe.boxes_per_layer if recipe else 0,
+                "active_pallet_boxes": ctx.active_pallet_boxes,
+                "target_pallet_boxes": target_boxes,
+                "cycle_time_sec": payload.cycle_time_sec,
+                "ewma_cycle_sec": round(ctx.ewma_cycle_sec, 2),
+                "alarm_code": payload.alarm_code,
+                "alarm_description": payload.alarm_description,
+                "in_downtime": ctx.open_downtime_id is not None,
+            }
+
+    async def _get_recipe(self, session: AsyncSession, sku: str) -> Optional[ProductRecipe]:
+        res = await session.execute(select(ProductRecipe).where(ProductRecipe.sku == sku))
+        return res.scalar_one_or_none()
+
+    async def _handle_state_transition(
+        self,
+        session: AsyncSession,
+        ctx: LineRuntimeContext,
+        prev: Optional[PLCTelemetryPayload],
+        curr: PLCTelemetryPayload,
+    ) -> None:
+        is_stopped = curr.machine_state != MachineStateEnum.RUNNING.value
+
+        # Caso 1: Entrou em parada agora (ou mudou o tipo de parada/alarme)
+        if is_stopped and ctx.open_downtime_id is None:
+            dtype = (
+                DowntimeTypeEnum.FAULT
+                if curr.machine_state == MachineStateEnum.FAULT.value
+                else DowntimeTypeEnum.MICROSTOP
+            )
+            ev = DowntimeEvent(
+                line_id=curr.line_id,
+                machine_state=curr.machine_state,
+                downtime_type=dtype,
+                alarm_code=curr.alarm_code,
+                alarm_description=curr.alarm_description,
+                started_at=curr.timestamp,
+            )
+            session.add(ev)
+            await session.flush()
+            ctx.open_downtime_id = ev.id
+            ctx.open_downtime_start = curr.timestamp
+            logger.info("downtime_opened", line_id=curr.line_id, downtime_id=ev.id, state=curr.machine_state)
+
+        # Caso 2: Continua parado — atualiza classificação se ultrapassou limiar de microparada
+        elif is_stopped and ctx.open_downtime_id is not None and ctx.open_downtime_start:
+            elapsed = (curr.timestamp - ctx.open_downtime_start).total_seconds()
+            if elapsed >= settings.MICROSTOP_THRESHOLD_SEC:
+                ev = await session.get(DowntimeEvent, ctx.open_downtime_id)
+                if ev and ev.downtime_type == DowntimeTypeEnum.MICROSTOP:
+                    ev.downtime_type = DowntimeTypeEnum.MACROSTOP
+
+        # Caso 3: Voltou a operar — fecha o evento de parada com duração exata
+        elif not is_stopped and ctx.open_downtime_id is not None:
+            ev = await session.get(DowntimeEvent, ctx.open_downtime_id)
+            if ev:
+                duration = max(0.0, (curr.timestamp - ev.started_at).total_seconds())
+                ev.ended_at = curr.timestamp
+                ev.duration_sec = round(duration, 2)
+                if ev.downtime_type == DowntimeTypeEnum.MICROSTOP and duration >= settings.MICROSTOP_THRESHOLD_SEC:
+                    ev.downtime_type = DowntimeTypeEnum.MACROSTOP
+                logger.info("downtime_closed", line_id=curr.line_id, downtime_id=ev.id, duration_sec=duration)
+            ctx.open_downtime_id = None
+            ctx.open_downtime_start = None
+
+    async def _handle_pallet_tracking(
+        self,
+        session: AsyncSession,
+        ctx: LineRuntimeContext,
+        prev: Optional[PLCTelemetryPayload],
+        curr: PLCTelemetryPayload,
+        recipe: Optional[ProductRecipe],
+    ) -> None:
+        target_boxes = (recipe.boxes_per_layer * recipe.total_layers) if recipe else 0
+
+        # Inicia novo palete rastreado se ainda não houver um aberto
+        if ctx.active_pallet_id is None:
+            pallet = PalletRecord(
+                line_id=curr.line_id,
+                pallet_uid=f"{curr.line_id}-{curr.timestamp.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}",
+                sku=curr.sku,
+                target_boxes=target_boxes,
+                actual_boxes=0,
+                max_layer_reached=curr.current_layer,
+                status=PalletStatusEnum.IN_PROGRESS,
+                started_at=curr.timestamp,
+            )
+            session.add(pallet)
+            await session.flush()
+            ctx.active_pallet_id = pallet.id
+            ctx.active_pallet_boxes = 0
+
+        if prev is None:
+            return
+
+        # Delta seguro contra reset de contador no CLP (troca de turno / queda de energia)
+        if curr.boxes_shift >= prev.boxes_shift:
+            delta_boxes = curr.boxes_shift - prev.boxes_shift
+        else:
+            delta_boxes = curr.boxes_shift
+            logger.info("plc_counter_rollover_detected", line_id=curr.line_id, new_val=curr.boxes_shift)
+
+        ctx.active_pallet_boxes += delta_boxes
+
+        active_pallet = await session.get(PalletRecord, ctx.active_pallet_id)
+        if not active_pallet:
+            return
+
+        active_pallet.actual_boxes = ctx.active_pallet_boxes
+        active_pallet.max_layer_reached = max(active_pallet.max_layer_reached, curr.current_layer)
+
+        # Validação de integridade da receita (Formação do Palete)
+        if recipe:
+            if curr.boxes_in_layer > recipe.boxes_per_layer or curr.current_layer > recipe.total_layers:
+                await self._emit_alert(
+                    session, ctx, curr.line_id, "PALLET_PATTERN_ANOMALY", "CRITICAL",
+                    f"Excesso detectado no padrão do SKU {curr.sku}: Camada {curr.current_layer}/{recipe.total_layers}, "
+                    f"Caixas na camada {curr.boxes_in_layer}/{recipe.boxes_per_layer}.",
+                    {"sku": curr.sku, "layer": curr.current_layer, "boxes_in_layer": curr.boxes_in_layer},
+                    curr.timestamp,
+                )
+
+        # Troca de SKU com palete aberto no meio -> Aborta palete anterior
+        if curr.sku != prev.sku and ctx.active_pallet_boxes > 0:
+            active_pallet.status = PalletStatusEnum.INCOMPLETE_ABORTED
+            active_pallet.completed_at = curr.timestamp
+            await self._emit_alert(
+                session, ctx, curr.line_id, "SKU_CHANGED_MID_PALLET", "WARNING",
+                f"Troca de SKU ({prev.sku} -> {curr.sku}) antes da conclusão do palete.",
+                {"pallet_uid": active_pallet.pallet_uid},
+                curr.timestamp,
+            )
+            ctx.active_pallet_id = None
+            ctx.active_pallet_boxes = 0
+            return
+
+        # Conclusão do palete (incremento no contador do CLP)
+        if curr.completed_pallets > prev.completed_pallets:
+            if target_boxes > 0 and active_pallet.actual_boxes > target_boxes:
+                active_pallet.status = PalletStatusEnum.OVERCOUNT_ANOMALY
+            elif target_boxes > 0 and active_pallet.actual_boxes < target_boxes:
+                active_pallet.status = PalletStatusEnum.INCOMPLETE_ABORTED
+            else:
+                active_pallet.status = PalletStatusEnum.COMPLETE
+            active_pallet.completed_at = curr.timestamp
+            ctx.active_pallet_id = None
+            ctx.active_pallet_boxes = 0
+
+    async def _handle_cycle_ewma(
+        self,
+        session: AsyncSession,
+        ctx: LineRuntimeContext,
+        curr: PLCTelemetryPayload,
+        recipe: Optional[ProductRecipe],
+    ) -> None:
+        if curr.machine_state != MachineStateEnum.RUNNING.value or curr.cycle_time_sec <= 0:
+            return
+
+        if ctx.ewma_cycle_sec == 0.0:
+            ctx.ewma_cycle_sec = curr.cycle_time_sec
+        else:
+            alpha = settings.EWMA_ALPHA
+            ctx.ewma_cycle_sec = alpha * curr.cycle_time_sec + (1.0 - alpha) * ctx.ewma_cycle_sec
+
+        if recipe and ctx.ewma_cycle_sec > recipe.ideal_cycle_sec * settings.CYCLE_DEGRADATION_FACTOR:
+            ctx.degradation_streak += 1
+            if ctx.degradation_streak >= 10:
+                await self._emit_alert(
+                    session, ctx, curr.line_id, "CYCLE_TIME_DEGRADATION", "WARNING",
+                    f"Degradação no tempo de ciclo: EWMA {ctx.ewma_cycle_sec:.2f}s vs Ideal {recipe.ideal_cycle_sec:.2f}s.",
+                    {"ewma": round(ctx.ewma_cycle_sec, 2), "ideal": recipe.ideal_cycle_sec},
+                    curr.timestamp,
+                )
+                ctx.degradation_streak = 0
+        else:
+            ctx.degradation_streak = 0
+
+    async def _emit_alert(
+        self,
+        session: AsyncSession,
+        ctx: LineRuntimeContext,
+        line_id: str,
+        alert_type: str,
+        severity: str,
+        message: str,
+        metadata: dict,
+        now: datetime,
+    ) -> None:
+        # Throttling de alertas (evita flood no banco em condições persistentes)
+        if ctx.last_alert_at and (now - ctx.last_alert_at).total_seconds() < 30:
+            return
+        ctx.last_alert_at = now
+        session.add(
+            AnomalyAlert(
+                line_id=line_id,
+                alert_type=alert_type,
+                severity=severity,
+                message=message,
+                metadata_json=metadata,
+                created_at=now,
+            )
+        )
+app/services/oee_engine.py
+Python
+from datetime import datetime
+from sqlalchemy import and_, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models import (
+    DowntimeEvent, PalletRecord, PalletStatusEnum, ProductRecipe, ReasonCode, TelemetryPoint
+)
+from app.schemas.telemetry import OEEResponse
+
+
+class OEEAnalyticsEngine:
+    @staticmethod
+    async def calculate_oee(
+        session: AsyncSession, line_id: str, start: datetime, end: datetime
+    ) -> OEEResponse:
+        total_window_sec = max(1.0, (end - start).total_seconds())
+
+        # 1. Soma paradas planejadas e não planejadas que interceptam a janela
+        downtime_stmt = (
+            select(DowntimeEvent, ReasonCode)
+            .outerjoin(ReasonCode, DowntimeEvent.reason_code_id == ReasonCode.id)
+            .where(
+                and_(
+                    DowntimeEvent.line_id == line_id,
+                    DowntimeEvent.started_at < end,
+                    (DowntimeEvent.ended_at.is_(None)) | (DowntimeEvent.ended_at > start),
+                )
+            )
+        )
+        rows = (await session.execute(downtime_stmt)).all()
+
+        planned_stop_sec = 0.0
+        unplanned_stop_sec = 0.0
+        for ev, reason in rows:
+            ev_start = max(start, ev.started_at)
+            ev_end = min(end, ev.ended_at or end)
+            dur = max(0.0, (ev_end - ev_start).total_seconds())
+            if reason and reason.is_planned_stop:
+                planned_stop_sec += dur
+            else:
+                unplanned_stop_sec += dur
+
+        planned_time_sec = max(1.0, total_window_sec - planned_stop_sec)
+        running_time_sec = max(0.0, planned_time_sec - unplanned_stop_sec)
+        availability = min(1.0, running_time_sec / planned_time_sec)
+
+        # 2. Total de caixas produzidas na janela (via paletes rastreados + deltas)
+        pallet_stmt = select(PalletRecord).where(
+            and_(
+                PalletRecord.line_id == line_id,
+                PalletRecord.started_at >= start,
+                PalletRecord.started_at <= end,
+            )
+        )
+        pallets = (await session.execute(pallet_stmt)).scalars().all()
+        total_boxes = sum(p.actual_boxes for p in pallets)
+        completed_count = sum(1 for p in pallets if p.status != PalletStatusEnum.IN_PROGRESS)
+        valid_boxes = sum(
+            p.actual_boxes for p in pallets if p.status in (PalletStatusEnum.COMPLETE, PalletStatusEnum.IN_PROGRESS)
+        )
+
+        # 3. Performance ponderada pelo ciclo ideal das receitas usadas
+        ideal_time_earned_sec = 0.0
+        recipes_cache: dict[str, float] = {}
+        for p in pallets:
+            if p.sku not in recipes_cache:
+                r = (await session.execute(select(ProductRecipe).where(ProductRecipe.sku == p.sku))).scalar_one_or_none()
+                recipes_cache[p.sku] = r.ideal_cycle_sec if r else 4.0
+            ideal_time_earned_sec += p.actual_boxes * recipes_cache[p.sku]
+
+        performance = min(1.0, ideal_time_earned_sec / running_time_sec) if running_time_sec > 0 else 0.0
+        quality = (valid_boxes / total_boxes) if total_boxes > 0 else 1.0
+        oee = availability * performance * quality
+
+        return OEEResponse(
+            line_id=line_id,
+            window_start=start,
+            window_end=end,
+            availability=round(availability * 100, 2),
+            performance=round(performance * 100, 2),
+            quality=round(quality * 100, 2),
+            oee=round(oee * 100, 2),
+            total_boxes=total_boxes,
+            total_pallets=completed_count,
+            planned_time_sec=round(planned_time_sec, 1),
+            running_time_sec=round(running_time_sec, 1),
+            downtime_sec=round(unplanned_stop_sec, 1),
+        )
+
+    @staticmethod
+    async def get_pareto_downtimes(
+        session: AsyncSession, line_id: str, start: datetime, end: datetime, limit: int = 5
+    ) -> list[dict]:
+        stmt = (
+            select(
+                func.coalesce(ReasonCode.description, "Não Justificada / Falha Automática").label("reason"),
+                func.count(DowntimeEvent.id).label("occurrences"),
+                func.sum(func.coalesce(DowntimeEvent.duration_sec, 0.0)).label("total_duration_sec"),
+            )
+            .outerjoin(ReasonCode, DowntimeEvent.reason_code_id == ReasonCode.id)
+            .where(
+                and_(
+                    DowntimeEvent.line_id == line_id,
+                    DowntimeEvent.started_at >= start,
+                    DowntimeEvent.started_at <= end,
+                )
+            )
+            .group_by("reason")
+            .order_by(func.sum(func.coalesce(DowntimeEvent.duration_sec, 0.0)).desc())
+            .limit(limit)
+        )
+        rows = (await session.execute(stmt)).all()
+        return [
+            {
+                "reason": r.reason,
+                "occurrences": r.occurrences,
+                "total_duration_sec": round(float(r.total_duration_sec), 1),
+            }
+            for r in rows
+        ]
+7. Ingestão MQTT Resiliente, Batch Writer & Redis
+app/services/mqtt_ingestor.py
+Python
+import asyncio
+import json
+from typing import List
+import aiomqtt
+import structlog
+from redis.asyncio import Redis
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.core.config import settings
+from app.db.models import TelemetryPoint
+from app.db.session import AsyncSessionLocal
+from app.schemas.telemetry import PLCTelemetryPayload
+from app.services.state_engine import StateAndPalletEngine
+
+logger = structlog.get_logger()
+
+
+class IndustrialIngestionPipeline:
+    def __init__(self, redis_client: Redis) -> None:
+        self.redis = redis_client
+        self.state_engine = StateAndPalletEngine()
+        self.queue: asyncio.Queue[PLCTelemetryPayload] = asyncio.Queue(maxsize=5000)
+        self.ts_buffer: List[dict] = []
+        self._running = False
+        self._tasks: List[asyncio.Task] = []
+
+    async def start(self) -> None:
+        self._running = True
+        self._tasks = [
+            asyncio.create_task(self._mqtt_consumer_loop()),
+            asyncio.create_task(self._processing_worker()),
+            asyncio.create_task(self._batch_writer_loop()),
+        ]
+        logger.info("ingestion_pipeline_started")
+
+    async def stop(self) -> None:
+        self._running = False
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self._flush_timeseries()
+        logger.info("ingestion_pipeline_stopped")
+
+    async def _mqtt_consumer_loop(self) -> None:
+        backoff = 1
+        while self._running:
+            try:
+                async with aiomqtt.Client(hostname=settings.MQTT_HOST, port=settings.MQTT_PORT) as client:
+                    await client.subscribe(settings.MQTT_TOPIC, qos=1)
+                    logger.info("mqtt_connected", topic=settings.MQTT_TOPIC)
+                    backoff = 1
+                    async for message in client.messages:
+                        try:
+                            raw = json.loads(message.payload.decode("utf-8"))
+                            payload = PLCTelemetryPayload.model_validate(raw)
+                            await self.queue.put(payload)
+                        except Exception as exc:
+                            logger.error("invalid_mqtt_payload", error=str(exc), topic=message.topic.value)
+            except aiomqtt.MqttError as exc:
+                logger.warning("mqtt_connection_lost_retrying", error=str(exc), backoff_sec=backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(30, backoff * 2)
+
+    async def _processing_worker(self) -> None:
+        while self._running:
+            payload = await self.queue.get()
+            try:
+                async with AsyncSessionLocal() as session:
+                    snapshot = await self.state_engine.process_telemetry(session, payload)
+
+                if snapshot:
+                    # 1. Atualiza Cache Quente no Redis (para carregamento instantâneo da tela)
+                    await self.redis.set(f"line:state:{payload.line_id}", json.dumps(snapshot), ex=300)
+                    # 2. Publica em tempo real via Redis Pub/Sub para todos os WebSockets conectados
+                    await self.redis.publish(f"ws:line:{payload.line_id}", json.dumps(snapshot))
+
+                    # 3. Enfileira ponto para gravação em lote no TimescaleDB
+                    self.ts_buffer.append(
+                        {
+                            "time": payload.timestamp,
+                            "line_id": payload.line_id,
+                            "machine_state": payload.machine_state,
+                            "robot_status": payload.robot_status,
+                            "conveyor_in_ok": payload.conveyor_in_ok,
+                            "conveyor_out_ok": payload.conveyor_out_ok,
+                            "sku": payload.sku,
+                            "boxes_shift": payload.boxes_shift,
+                            "completed_pallets": payload.completed_pallets,
+                            "current_layer": payload.current_layer,
+                            "boxes_in_layer": payload.boxes_in_layer,
+                            "cycle_time_sec": payload.cycle_time_sec,
+                            "ewma_cycle_sec": snapshot["ewma_cycle_sec"],
+                            "alarm_code": payload.alarm_code,
+                        }
+                    )
+                    if len(self.ts_buffer) >= settings.BATCH_MAX_SIZE:
+                        await self._flush_timeseries()
+            except Exception as exc:
+                logger.exception("processing_worker_error", error=str(exc))
+            finally:
+                self.queue.task_done()
+
+    async def _batch_writer_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(settings.BATCH_FLUSH_INTERVAL_SEC)
+            if self.ts_buffer:
+                await self._flush_timeseries()
+
+    async def _flush_timeseries(self) -> None:
+        if not self.ts_buffer:
+            return
+        batch = self.ts_buffer[:]
+        self.ts_buffer.clear()
+        try:
+            async with AsyncSessionLocal() as session:
+                stmt = pg_insert(TelemetryPoint).values(batch).on_conflict_do_nothing(
+                    index_elements=["line_id", "time"]
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as exc:
+            logger.error("batch_timeseries_flush_failed", count=len(batch), error=str(exc))
+8. WebSocket Escalável & Rotas REST
+app/api/ws.py
+Python
+import asyncio
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from redis.asyncio import Redis
+
+router = APIRouter()
+
+
+@router.websocket("/ws/lines/{line_id}")
+async def line_realtime_ws(websocket: WebSocket, line_id: str) -> None:
+    await websocket.accept()
+    redis: Redis = websocket.app.state.redis
+
+    # Envia último estado em cache imediatamente na conexão
+    cached = await redis.get(f"line:state:{line_id}")
+    if cached:
+        await websocket.send_text(cached.decode("utf-8") if isinstance(cached, bytes) else cached)
+
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(f"ws:line:{line_id}")
+
+    try:
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if message and message["data"]:
+                data = message["data"]
+                await websocket.send_text(data.decode("utf-8") if isinstance(data, bytes) else data)
+            await asyncio.sleep(0.05)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await pubsub.unsubscribe(f"ws:line:{line_id}")
+        await pubsub.close()
+app/api/routes.py
+Python
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import desc, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models import (
+    AnomalyAlert, DowntimeEvent, PalletRecord, ProductRecipe, ReasonCode, TelemetryPoint
+)
+from app.db.session import get_db
+from app.schemas.telemetry import DowntimeJustifyRequest, OEEResponse, RecipeCreateRequest
+from app.services.oee_engine import OEEAnalyticsEngine
+
+router = APIRouter(prefix="/api/v1")
+
+
+@router.get("/health")
+async def health_check(request: Request, db: AsyncSession = Depends(get_db)) -> dict:
+    await db.execute(text("SELECT 1"))
+    redis_ok = await request.app.state.redis.ping()
+    return {"status": "healthy", "database": "up", "redis": "up" if redis_ok else "down"}
+
+
+@router.post("/recipes", status_code=201)
+async def create_recipe(payload: RecipeCreateRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    existing = (await db.execute(select(ProductRecipe).where(ProductRecipe.sku == payload.sku))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail="SKU already exists")
+    recipe = ProductRecipe(**payload.model_dump(), created_at=datetime.now(timezone.utc))
+    db.add(recipe)
+    await db.commit()
+    return {"id": recipe.id, "sku": recipe.sku}
+
+
+@router.get("/recipes")
+async def list_recipes(db: AsyncSession = Depends(get_db)) -> list[dict]:
+    rows = (await db.execute(select(ProductRecipe))).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "sku": r.sku,
+            "name": r.name,
+            "boxes_per_layer": r.boxes_per_layer,
+            "total_layers": r.total_layers,
+            "ideal_cycle_sec": r.ideal_cycle_sec,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/lines/{line_id}/downtimes")
+async def list_downtimes(
+    line_id: str,
+    only_unjustified: bool = False,
+    limit: int = Query(50, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    stmt = select(DowntimeEvent).where(DowntimeEvent.line_id == line_id)
+    if only_unjustified:
+        stmt = stmt.where(DowntimeEvent.reason_code_id.is_(None))
+    stmt = stmt.order_by(desc(DowntimeEvent.started_at)).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": d.id,
+            "type": d.downtime_type.value,
+            "machine_state": d.machine_state,
+            "alarm_code": d.alarm_code,
+            "alarm_description": d.alarm_description,
+            "started_at": d.started_at,
+            "ended_at": d.ended_at,
+            "duration_sec": d.duration_sec,
+            "reason_code_id": d.reason_code_id,
+            "justified_by": d.justified_by,
+        }
+        for d in rows
+    ]
+
+
+@router.post("/downtimes/{downtime_id}/justify")
+async def justify_downtime(
+    downtime_id: int, body: DowntimeJustifyRequest, db: AsyncSession = Depends(get_db)
+) -> dict:
+    ev = await db.get(DowntimeEvent, downtime_id)
+    if not ev:
+        raise HTTPException(status_code=404, detail="Downtime event not found")
+    reason = await db.get(ReasonCode, body.reason_code_id)
+    if not reason:
+        raise HTTPException(status_code=404, detail="Reason code not found")
+
+    ev.reason_code_id = body.reason_code_id
+    ev.justified_by = body.justified_by
+    ev.justification_notes = body.notes
+    await db.commit()
+    return {"status": "justified", "downtime_id": ev.id, "reason": reason.description}
+
+
+@router.get("/lines/{line_id}/pallets")
+async def list_pallets(
+    line_id: str,
+    sku: Optional[str] = None,
+    limit: int = Query(50, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    stmt = select(PalletRecord).where(PalletRecord.line_id == line_id)
+    if sku:
+        stmt = stmt.where(PalletRecord.sku == sku)
+    rows = (await db.execute(stmt.order_by(desc(PalletRecord.started_at)).limit(limit))).scalars().all()
+    return [
+        {
+            "pallet_uid": p.pallet_uid,
+            "sku": p.sku,
+            "target_boxes": p.target_boxes,
+            "actual_boxes": p.actual_boxes,
+            "max_layer_reached": p.max_layer_reached,
+            "status": p.status.value,
+            "started_at": p.started_at,
+            "completed_at": p.completed_at,
+        }
+        for p in rows
+    ]
+
+
+@router.get("/lines/{line_id}/alerts")
+async def list_alerts(line_id: str, limit: int = 30, db: AsyncSession = Depends(get_db)) -> list[dict]:
+    stmt = (
+        select(AnomalyAlert)
+        .where(AnomalyAlert.line_id == line_id)
+        .order_by(desc(AnomalyAlert.created_at))
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": a.id,
+            "alert_type": a.alert_type,
+            "severity": a.severity,
+            "message": a.message,
+            "metadata": a.metadata_json,
+            "created_at": a.created_at,
+        }
+        for a in rows
+    ]
+
+
+@router.get("/lines/{line_id}/oee", response_model=OEEResponse)
+async def get_oee(
+    line_id: str,
+    hours: int = Query(8, ge=1, le=720),
+    db: AsyncSession = Depends(get_db),
+) -> OEEResponse:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours)
+    return await OEEAnalyticsEngine.calculate_oee(db, line_id, start, end)
+
+
+@router.get("/lines/{line_id}/pareto")
+async def get_pareto(
+    line_id: str, hours: int = Query(24, ge=1, le=720), db: AsyncSession = Depends(get_db)
+) -> list[dict]:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours)
+    return await OEEAnalyticsEngine.get_pareto_downtimes(db, line_id, start, end)
+
+
+@router.get("/lines/{line_id}/timeseries")
+async def get_timeseries(
+    line_id: str, minutes: int = Query(60, ge=5, le=1440), db: AsyncSession = Depends(get_db)
+) -> list[dict]:
+    since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    stmt = (
+        select(TelemetryPoint)
+        .where(TelemetryPoint.line_id == line_id, TelemetryPoint.time >= since)
+        .order_by(TelemetryPoint.time.asc())
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "time": r.time,
+            "state": r.machine_state,
+            "boxes_shift": r.boxes_shift,
+            "cycle_time_sec": r.cycle_time_sec,
+            "ewma_cycle_sec": r.ewma_cycle_sec,
+        }
+        for r in rows
+    ]
+app/main.py
+Python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from redis.asyncio import Redis
+
+from app.api.routes import router as api_router
+from app.api.ws import router as ws_router
+from app.core.config import settings
+from app.db.session import init_db
+from app.services.mqtt_ingestor import IndustrialIngestionPipeline
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    redis_client = Redis.from_url(settings.REDIS_URL)
+    app.state.redis = redis_client
+
+    pipeline = IndustrialIngestionPipeline(redis_client=redis_client)
+    await pipeline.start()
+    app.state.pipeline = pipeline
+    try:
+        yield
+    finally:
+        await pipeline.stop()
+        await redis_client.close()
+
+
+app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(api_router)
+app.include_router(ws_router)
+
+Instrumentator().instrument(app).expose(app)
+9. Simulador de CLP/Edge (Para Executar e Testar Tudo Agora)
+simulator.py
+Este script simula um CLP real enviando telemetria a cada 1 segundo via MQTT, formando camadas/paletes, gerando degradação de ciclo e simulando uma falha no robô.
+Python
+import asyncio
+import json
+import random
+from datetime import datetime, timezone
+import aiomqtt
+
+
+async def run_plc_simulator() -> None:
+    line_id = "PAL-01"
+    sku = "CX-BEBIDA-12X1L"
+    boxes_per_layer = 8
+    total_layers = 4
+
+    boxes_shift = 0
+    completed_pallets = 0
+    current_layer = 1
+    boxes_in_layer = 0
+    tick = 0
+
+    async with aiomqtt.Client("localhost", 1883) as client:
+        print("Simulador de CLP conectado ao MQTT. Publicando telemetria...")
+        while True:
+            tick += 1
+            # Simula falha no robô entre os ticks 35 e 45
+            if 35 <= tick <= 45:
+                state, robot, alarm, desc, cycle = 5, 5, 402, "FALHA GARRA VACUO ROBO", 0.0
+            else:
+                state, robot, alarm, desc = 1, 1, 0, None
+                # Simula degradação gradual de ciclo após tick 50
+                cycle = 2.8 if tick < 50 else round(random.uniform(3.8, 4.4), 2)
+                boxes_shift += 1
+                boxes_in_layer += 1
+                if boxes_in_layer > boxes_per_layer:
+                    boxes_in_layer = 1
+                    current_layer += 1
+                    if current_layer > total_layers:
+                        current_layer = 1
+                        completed_pallets += 1
+
+            payload = {
+                "line_id": line_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "machine_state": state,
+                "robot_status": robot,
+                "conveyor_in_ok": True,
+                "conveyor_out_ok": True,
+                "sku": sku,
+                "boxes_shift": boxes_shift,
+                "completed_pallets": completed_pallets,
+                "current_layer": current_layer,
+                "boxes_in_layer": boxes_in_layer,
+                "cycle_time_sec": cycle,
+                "alarm_code": alarm,
+                "alarm_description": desc,
+            }
+            await client.publish(
+                f"fabrica/expedicao/{line_id}/telemetria",
+                json.dumps(payload),
+                qos=1,
+            )
+            print(f"[TX] caixas={boxes_shift} paletes={completed_pallets} camada={current_layer} state={state}")
+            await asyncio.sleep(1.0)
+
+
+if __name__ == "__main__":
+    asyncio.run(run_plc_simulator())
+10. Como Rodar o Sistema Completo
+Subir a infraestrutura (TimescaleDB + Redis + Mosquitto):
+Bash
+docker compose up -d
+Instalar dependências e iniciar o Backend:
+Bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+Cadastrar a receita do SKU de teste (Swagger em http://localhost:8000/docs ou via curl):
+Bash
+curl -X POST http://localhost:8000/api/v1/recipes \
+  -H "Content-Type: application/json" \
+  -d '{"sku":"CX-BEBIDA-12X1L","name":"Caixa 12x1L","boxes_per_layer":8,"total_layers":4,"ideal_cycle_sec":2.8}'
+Iniciar o simulador de CLP:
+Bash
+python simulator.py
+Validar em tempo real:
+WebSocket: conecte em ws://localhost:8000/ws/lines/PAL-01 para receber cada frame em < 50ms.
+OEE: GET http://localhost:8000/api/v1/lines/PAL-01/oee
+Paletes rastreados: GET http://localhost:8000/api/v1/lines/PAL-01/pallets
+Paradas e Alertas preditivos: GET http://localhost:8000/api/v1/lines/PAL-01/downtimes e /alerts
+Métricas Prometheus: GET http://localhost:8000/metrics

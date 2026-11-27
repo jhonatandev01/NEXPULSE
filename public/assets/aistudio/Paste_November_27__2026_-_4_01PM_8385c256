@@ -1,0 +1,812 @@
+ Implementando o Fallback Offline no Backend
+Adicione este módulo para garantir que o agente nunca quebre se a fábrica perder internet.
+app/agent/offline_fallback.py
+Python
+from typing import Dict, Any
+import httpx
+import structlog
+from app.agent.schemas import OneClickStopClassification, PredictiveHealthReport
+
+logger = structlog.get_logger()
+
+
+class OfflineAgentFallback:
+    """
+    Garante operação do NexPulse Agent sem internet:
+    1) Tenta LLM Local (Ollama na intranet da fábrica).
+    2) Se Ollama não estiver disponível, aplica regras determinísticas industriais.
+    """
+
+    @staticmethod
+    async def try_local_ollama(prompt: str, ollama_url: str = "http://localhost:11434") -> str | None:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{ollama_url}/api/generate",
+                    json={"model": "qwen2.5:7b", "prompt": prompt, "stream": False},
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("response")
+        except Exception as exc:
+            logger.debug("local_ollama_unavailable", reason=str(exc))
+        return None
+
+    @staticmethod
+    def deterministic_stop_classification(downtime_id: int, ctx: Dict[str, Any]) -> OneClickStopClassification:
+        """Regra local determinística baseada nos sensores pré-parada."""
+        ev = ctx.get("downtime_event", {})
+        reasons = ctx.get("reason_codes_disponiveis", [])
+        timeline = ctx.get("telemetria_60s_antes", {}).get("timeline", [])
+        last_sample = timeline[-1] if timeline else {}
+
+        state = ev.get("linha_estado")
+        in_ok = last_sample.get("esteira_entrada_ok", True)
+        out_ok = last_sample.get("esteira_saida_ok", True)
+
+        keyword = None
+        evidence = "Classificação offline por regras locais de sensores."
+        confidence = "MEDIA"
+
+        if state == 2 or not in_ok:
+            keyword = "material"
+            evidence = "Estado 2 ou sensor esteira_entrada_ok=False antes da parada (falta de caixas/insumo)."
+            confidence = "ALTA"
+        elif state == 3 or not out_ok:
+            keyword = "retirada"
+            evidence = "Estado 3 ou esteira_saida_ok=False (acúmulo na saída / aguardando empilhadeira)."
+            confidence = "ALTA"
+        elif state == 5:
+            keyword = "falha"
+            evidence = f"Falha física no equipamento (alarme_ativo_cod={ev.get('alarme_ativo_cod')})."
+            confidence = "ALTA"
+
+        matched = next((r for r in reasons if keyword and keyword in r["description"].lower()), None)
+        if not matched and reasons:
+            matched = reasons[0]
+            confidence = "BAIXA"
+
+        return OneClickStopClassification(
+            downtime_id=downtime_id,
+            suggested_reason_code_id=matched["id"] if matched else None,
+            suggested_reason_label=matched["description"] if matched else "Motivo não mapeado offline",
+            confidence=confidence,
+            evidence_summary=f"[MODO OFFLINE] {evidence}",
+            missing_variables=[] if timeline else ["telemetry_points_60s_antes"],
+        )
+
+    @staticmethod
+    def deterministic_predictive_check(line_id: str, health_ctx: Dict[str, Any]) -> PredictiveHealthReport:
+        drift = health_ctx.get("deriva_percentual", 0.0)
+        microstops = health_ctx.get("microparadas_na_janela", 0)
+        cycle_drift = drift > 15.0
+        spike = microstops >= 5
+
+        risk = "CRITICO" if (cycle_drift and spike) else ("ATENCAO" if (cycle_drift or spike) else "NORMAL")
+        inspections = []
+        if cycle_drift:
+            inspections.append("Inspecionar pressão de vácuo/ventosas da garra e lubrificação de eixos do robô.")
+        if spike:
+            inspections.append("Verificar alinhamento de sensores fotoelétricos e guias das esteiras.")
+
+        return PredictiveHealthReport(
+            line_id=line_id,
+            risk_level=risk,
+            cycle_drift_detected=cycle_drift,
+            microstop_spike_detected=spike,
+            summary=f"[MODO OFFLINE] Deriva de ciclo: {drift:.1f}% | Microparadas na janela: {microstops}.",
+            recommended_inspections=inspections,
+            missing_variables=[],
+        )
+Como plugar: No app/agent/nexpulse_agent.py, envolva a chamada self.client.aio.models.generate_content(...) em um try/except (httpx.ConnectError, Exception): se falhar por falta de rede/API, chame OfflineAgentFallback.try_local_ollama(...) ou o fallback determinístico correspondente!
+3. Frontend Completo do NexPulse Portal (React + TypeScript + Tailwind)
+Este painel foi projetado seguindo padrões de IHM Industrial (ISA-101): fundo escuro de alto contraste para TVs Andon/tablets, formação do palete em tempo real, alerta automático do Agente quando dispara alarme no WebSocket, confirmação de parada em 1 clique e Copiloto lateral.
+Criação rápida do projeto Vite:
+Bash
+npm create vite@latest nexpulse-portal -- --template react-ts
+cd nexpulse-portal
+npm install lucide-react
+npm install -D tailwindcss @tailwindcss/vite
+src/types/nexpulse.ts
+TypeScript
+export interface LineSnapshot {
+  line_id: string;
+  timestamp: string;
+  machine_state: number;
+  machine_state_label: string;
+  robot_status: number;
+  conveyor_in_ok: boolean;
+  conveyor_out_ok: boolean;
+  sku: string;
+  boxes_shift: number;
+  completed_pallets: number;
+  current_layer: number;
+  total_layers: number;
+  boxes_in_layer: number;
+  boxes_per_layer: number;
+  active_pallet_boxes: number;
+  target_pallet_boxes: number;
+  cycle_time_sec: number;
+  ewma_cycle_sec: number;
+  alarm_code: number;
+  alarm_description: string | null;
+  in_downtime: boolean;
+}
+
+export interface OEEMetrics {
+  oee: number;
+  availability: number;
+  performance: number;
+  quality: number;
+  total_boxes: number;
+  total_pallets: number;
+  downtime_sec: number;
+}
+
+export interface DowntimeItem {
+  id: number;
+  type: string;
+  machine_state: number;
+  alarm_code: number;
+  alarm_description: string | null;
+  started_at: string;
+  duration_sec: number | null;
+  reason_code_id: number | null;
+}
+
+export interface OneClickSuggestion {
+  downtime_id: number;
+  suggested_reason_code_id: number | null;
+  suggested_reason_label: string;
+  confidence: "ALTA" | "MEDIA" | "BAIXA";
+  evidence_summary: string;
+  missing_variables: string[];
+}
+
+export interface PredictiveReport {
+  line_id: string;
+  risk_level: "NORMAL" | "ATENCAO" | "CRITICO";
+  cycle_drift_detected: boolean;
+  microstop_spike_detected: boolean;
+  summary: string;
+  recommended_inspections: string[];
+}
+src/hooks/useLineWebSocket.ts (Reconexão Automática)
+TypeScript
+import { useEffect, useRef, useState } from "react";
+import { LineSnapshot } from "../types/nexpulse";
+
+export function useLineWebSocket(lineId: string, wsBaseUrl = "ws://localhost:8000") {
+  const [snapshot, setSnapshot] = useState<LineSnapshot | null>(null);
+  const [wsStatus, setWsStatus] = useState<"CONNECTING" | "ONLINE" | "OFFLINE">("CONNECTING");
+  const retryRef = useRef(1000);
+
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let timer: number | undefined;
+    let unmounted = false;
+
+    const connect = () => {
+      if (unmounted) return;
+      setWsStatus("CONNECTING");
+      ws = new WebSocket(`${wsBaseUrl}/ws/lines/${lineId}`);
+
+      ws.onopen = () => {
+        setWsStatus("ONLINE");
+        retryRef.current = 1000;
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data: LineSnapshot = JSON.parse(event.data);
+          setSnapshot(data);
+        } catch (err) {
+          console.error("Erro ao parsear frame WebSocket:", err);
+        }
+      };
+
+      ws.onclose = () => {
+        if (unmounted) return;
+        setWsStatus("OFFLINE");
+        timer = window.setTimeout(() => {
+          retryRef.current = Math.min(retryRef.current * 2, 15000);
+          connect();
+        }, retryRef.current);
+      };
+
+      ws.onerror = () => ws?.close();
+    };
+
+    connect();
+    return () => {
+      unmounted = true;
+      window.clearTimeout(timer);
+      ws?.close();
+    };
+  }, [lineId, wsBaseUrl]);
+
+  return { snapshot, wsStatus };
+}
+src/components/PalletVisualizer.tsx (Sinótico + Formação do Palete em Tempo Real)
+Tsx
+import React from "react";
+import { Box, Cpu, ArrowRight, Layers } from "lucide-react";
+import { LineSnapshot } from "../types/nexpulse";
+
+interface Props {
+  data: LineSnapshot;
+}
+
+export const PalletVisualizer: React.FC<Props> = ({ data }) => {
+  const totalBoxesLayer = Math.max(data.boxes_per_layer || 8, 1);
+  const totalLayers = Math.max(data.total_layers || 4, 1);
+  const slots = Array.from({ length: totalBoxesLayer }, (_, i) => i < data.boxes_in_layer);
+  const layers = Array.from({ length: totalLayers }, (_, i) => totalLayers - i);
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {/* Sinótico Simplificado da Célula */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-4">
+          Sinótico da Célula ({data.line_id})
+        </h3>
+        <div className="flex items-center justify-between gap-2 py-6">
+          <div className={`flex-1 p-3 rounded-lg border text-center ${
+            data.conveyor_in_ok ? "border-emerald-700/50 bg-emerald-950/20" : "border-amber-500 bg-amber-950/40"
+          }`}>
+            <p className="text-xs text-slate-400">Esteira Entrada</p>
+            <p className="font-bold text-sm mt-1">
+              {data.conveyor_in_ok ? "FLUXO OK" : "SEM CAIXA"}
+            </p>
+          </div>
+
+          <ArrowRight className="text-slate-600 shrink-0" size={20} />
+
+          <div className={`flex-1 p-3 rounded-lg border text-center ${
+            data.machine_state === 5
+              ? "border-red-500 bg-red-950/50 animate-pulse"
+              : data.machine_state === 1
+              ? "border-sky-600/60 bg-sky-950/30"
+              : "border-amber-600/60 bg-amber-950/30"
+          }`}>
+            <Cpu className="mx-auto mb-1 text-slate-300" size={20} />
+            <p className="text-xs text-slate-400">Robô Paletizador</p>
+            <p className="font-bold text-sm mt-0.5">{data.machine_state_label}</p>
+          </div>
+
+          <ArrowRight className="text-slate-600 shrink-0" size={20} />
+
+          <div className={`flex-1 p-3 rounded-lg border text-center ${
+            data.conveyor_out_ok ? "border-emerald-700/50 bg-emerald-950/20" : "border-amber-500 bg-amber-950/40"
+          }`}>
+            <p className="text-xs text-slate-400">Esteira Saída</p>
+            <p className="font-bold text-sm mt-1">
+              {data.conveyor_out_ok ? "LIVRE" : "PALETE CHEIO"}
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-4 pt-4 border-t border-slate-800 flex justify-between text-xs text-slate-400">
+          <span>SKU Ativo: <strong className="text-slate-100">{data.sku}</strong></span>
+          <span>Ciclo Atual: <strong className="text-sky-400">{data.cycle_time_sec.toFixed(2)}s</strong> (EWMA {data.ewma_cycle_sec.toFixed(2)}s)</span>
+        </div>
+      </div>
+
+      {/* Formação Visual do Palete (Camadas + Grade 2D) */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <div className="flex justify-between items-center mb-4">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+            <Layers size={15} /> Formação do Palete em Tempo Real
+          </h3>
+          <span className="text-xs font-mono bg-slate-800 px-2.5 py-1 rounded text-slate-200">
+            {data.active_pallet_boxes} / {data.target_pallet_boxes || "?"} cx
+          </span>
+        </div>
+
+        <div className="grid grid-cols-3 gap-4 items-center">
+          {/* Pilha vertical de camadas */}
+          <div className="col-span-1 flex flex-col gap-1.5">
+            {layers.map((layerNum) => {
+              const isDone = layerNum < data.current_layer;
+              const isActive = layerNum === data.current_layer;
+              return (
+                <div
+                  key={layerNum}
+                  className={`h-7 rounded flex items-center justify-center text-xs font-semibold border ${
+                    isDone
+                      ? "bg-emerald-600/30 border-emerald-500/60 text-emerald-200"
+                      : isActive
+                      ? "bg-sky-600/40 border-sky-400 text-white"
+                      : "bg-slate-800/60 border-slate-700 text-slate-500"
+                  }`}
+                >
+                  Camada {layerNum}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Grade 2D da camada atual */}
+          <div className="col-span-2 bg-slate-950 border border-slate-800 rounded-lg p-3">
+            <p className="text-xs text-slate-400 mb-2">
+              Camada Atual ({data.current_layer}/{totalLayers}) —{" "}
+              <strong className="text-slate-100">{data.boxes_in_layer}/{totalBoxesLayer} caixas</strong>
+            </p>
+            <div className="grid grid-cols-4 gap-2">
+              {slots.map((filled, idx) => (
+                <div
+                  key={idx}
+                  className={`h-10 rounded flex items-center justify-center border transition-all ${
+                    filled
+                      ? "bg-amber-600/30 border-amber-500 text-amber-200"
+                      : "bg-slate-900 border-slate-800 border-dashed text-slate-700"
+                  }`}
+                >
+                  <Box size={16} />
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+src/components/DowntimeOneClickCard.tsx (Classificação Rápida em 1 Clique)
+Tsx
+import React, { useState } from "react";
+import { Sparkles, CheckCircle2, Clock } from "lucide-react";
+import { DowntimeItem, OneClickSuggestion } from "../types/nexpulse";
+
+interface Props {
+  lineId: string;
+  downtimes: DowntimeItem[];
+  apiBaseUrl: string;
+  onJustified: () => void;
+}
+
+export const DowntimeOneClickCard: React.FC<Props> = ({ lineId, downtimes, apiBaseUrl, onJustified }) => {
+  const [suggestions, setSuggestions] = useState<Record<number, OneClickSuggestion>>({});
+  const [loadingId, setLoadingId] = useState<number | null>(null);
+
+  const askAISuggestion = async (downtimeId: number) => {
+    setLoadingId(downtimeId);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/v1/agent/lines/${lineId}/downtimes/${downtimeId}/suggest`, {
+        method: "POST",
+      });
+      const data: OneClickSuggestion = await res.json();
+      setSuggestions((prev) => ({ ...prev, [downtimeId]: data }));
+    } finally {
+      setLoadingId(null);
+    }
+  };
+
+  const confirmOneClick = async (downtimeId: number, reasonCodeId: number, evidence: string) => {
+    await fetch(`${apiBaseUrl}/api/v1/downtimes/${downtimeId}/justify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        reason_code_id: reasonCodeId,
+        justified_by: "Operador (1-Clique IA)",
+        notes: evidence,
+      }),
+    });
+    onJustified();
+  };
+
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+          <Clock size={15} /> Paradas Aguardando Justificativa ({downtimes.length})
+        </h3>
+      </div>
+
+      {downtimes.length === 0 ? (
+        <p className="text-sm text-slate-500 py-4 text-center">Nenhuma parada pendente neste turno.</p>
+      ) : (
+        <div className="space-y-3">
+          {downtimes.slice(0, 4).map((dt) => {
+            const sug = suggestions[dt.id];
+            return (
+              <div key={dt.id} className="bg-slate-950 border border-slate-800 rounded-lg p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <span className="text-xs font-bold px-2 py-0.5 rounded bg-red-950 text-red-300 border border-red-800/50 mr-2">
+                      {dt.type}
+                    </span>
+                    <span className="text-sm text-slate-200 font-medium">
+                      {dt.alarm_description || `Estado ${dt.machine_state} / Alarme ${dt.alarm_code}`}
+                    </span>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Início: {new Date(dt.started_at).toLocaleTimeString()} • Duração:{" "}
+                      {dt.duration_sec ? `${dt.duration_sec}s` : "Em andamento"}
+                    </p>
+                  </div>
+
+                  {!sug && (
+                    <button
+                      onClick={() => askAISuggestion(dt.id)}
+                      disabled={loadingId === dt.id}
+                      className="flex items-center gap-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded-lg transition"
+                    >
+                      <Sparkles size={14} />
+                      {loadingId === dt.id ? "Analisando sensores..." : "Classificar com IA"}
+                    </button>
+                  )}
+                </div>
+
+                {sug && (
+                  <div className="mt-3 pt-3 border-t border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="text-xs">
+                      <span className="text-indigo-400 font-bold">Sugestão ({sug.confidence}): </span>
+                      <span className="text-slate-100 font-semibold">{sug.suggested_reason_label}</span>
+                      <p className="text-slate-400 mt-0.5">{sug.evidence_summary}</p>
+                    </div>
+                    {sug.suggested_reason_code_id !== null ? (
+                      <button
+                        onClick={() => confirmOneClick(dt.id, sug.suggested_reason_code_id!, sug.evidence_summary)}
+                        className="shrink-0 flex items-center gap-1.5 text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-2 rounded-lg"
+                      >
+                        <CheckCircle2 size={15} /> Confirmar em 1 Clique
+                      </button>
+                    ) : (
+                      <span className="text-xs text-amber-400">Cadastre ReasonCodes no banco para confirmar</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+src/components/NexPulseCopilotDrawer.tsx (Copiloto Chat + Diagnóstico Automático de Alarme)
+Tsx
+import React, { useEffect, useState } from "react";
+import { Bot, Send, ShieldAlert, X, Activity } from "lucide-react";
+import { LineSnapshot, PredictiveReport } from "../types/nexpulse";
+
+interface Props {
+  lineId: string;
+  apiBaseUrl: string;
+  snapshot: LineSnapshot | null;
+  isOpen: boolean;
+  onClose: () => void;
+}
+
+interface ChatMsg {
+  role: "user" | "agent" | "alarm";
+  text: string;
+}
+
+export const NexPulseCopilotDrawer: React.FC<Props> = ({ lineId, apiBaseUrl, snapshot, isOpen, onClose }) => {
+  const [role, setRole] = useState<"operador" | "manutencao" | "supervisor">("manutencao");
+  const [input, setInput] = useState("");
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [lastDiagnosedAlarm, setLastDiagnosedAlarm] = useState<number>(0);
+  const [predictive, setPredictive] = useState<PredictiveReport | null>(null);
+
+  // Gatilho automático via WebSocket quando um alarme novo dispara (linha_estado == 5)
+  useEffect(() => {
+    if (!snapshot) return;
+    if (snapshot.alarm_code > 0 && snapshot.alarm_code !== lastDiagnosedAlarm) {
+      setLastDiagnosedAlarm(snapshot.alarm_code);
+      (async () => {
+        try {
+          const res = await fetch(`${apiBaseUrl}/api/v1/agent/alarms/diagnose`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              line_id: lineId,
+              alarme_ativo_cod: snapshot.alarm_code,
+              alarm_description: snapshot.alarm_description,
+            }),
+          });
+          const data = await res.json();
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "alarm",
+              text: `🚨 ALARME ${snapshot.alarm_code} DETECTADO AUTOMATICAMENTE:\n\n${data.diagnosis_markdown}`,
+            },
+          ]);
+        } catch (err) {
+          console.error("Falha no diagnóstico automático:", err);
+        }
+      })();
+    } else if (snapshot.alarm_code === 0 && lastDiagnosedAlarm !== 0) {
+      setLastDiagnosedAlarm(0);
+    }
+  }, [snapshot?.alarm_code]);
+
+  const sendMessage = async (textToSend?: string) => {
+    const query = (textToSend ?? input).trim();
+    if (!query || loading) return;
+    if (!textToSend) setInput("");
+
+    setMessages((prev) => [...prev, { role: "user", text: query }]);
+    setLoading(true);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/v1/agent/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          line_id: lineId,
+          session_id: sessionId,
+          user_role: role,
+          message: query,
+        }),
+      });
+      const data = await res.json();
+      setSessionId(data.session_id);
+      setMessages((prev) => [...prev, { role: "agent", text: data.answer_markdown }]);
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        { role: "agent", text: "Erro de comunicação com o backend do Agente NexPulse." },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const checkPredictive = async () => {
+    const res = await fetch(`${apiBaseUrl}/api/v1/agent/lines/${lineId}/predictive-check?hours=4`);
+    setPredictive(await res.json());
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-y-0 right-0 w-full max-w-md bg-slate-950 border-l border-slate-800 shadow-2xl flex flex-col z-50">
+      <div className="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-900">
+        <div className="flex items-center gap-2">
+          <Bot className="text-indigo-400" size={20} />
+          <div>
+            <h2 className="text-sm font-bold text-white">Copiloto Industrial NexPulse</h2>
+            <p className="text-[11px] text-slate-400">Somente leitura • CLP é fonte única da verdade</p>
+          </div>
+        </div>
+        <button onClick={onClose} className="text-slate-400 hover:text-white"><X size={20} /></button>
+      </div>
+
+      {/* Perfil & Ações Rápidas */}
+      <div className="p-3 border-b border-slate-800 bg-slate-900/50 space-y-2">
+        <div className="flex gap-1.5">
+          {(["operador", "manutencao", "supervisor"] as const).map((r) => (
+            <button
+              key={r}
+              onClick={() => setRole(r)}
+              className={`flex-1 py-1 text-xs rounded font-medium capitalize ${
+                role === r ? "bg-indigo-600 text-white" : "bg-slate-800 text-slate-400"
+              }`}
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+        <div className="flex gap-1.5 flex-wrap">
+          <button
+            onClick={() => sendMessage("Faça uma análise do OEE e dos gargalos deste turno.")}
+            className="text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-200 px-2.5 py-1 rounded"
+          >
+            Analisar OEE do Turno
+          </button>
+          <button
+            onClick={checkPredictive}
+            className="text-[11px] bg-slate-800 hover:bg-slate-700 text-amber-300 px-2.5 py-1 rounded flex items-center gap-1"
+          >
+            <Activity size={12} /> Saúde Preditiva
+          </button>
+        </div>
+
+        {predictive && (
+          <div className={`p-2.5 rounded-lg border text-xs ${
+            predictive.risk_level === "CRITICO"
+              ? "bg-red-950/40 border-red-700 text-red-200"
+              : predictive.risk_level === "ATENCAO"
+              ? "bg-amber-950/40 border-amber-700 text-amber-200"
+              : "bg-emerald-950/30 border-emerald-800 text-emerald-200"
+          }`}>
+            <strong>Risco Preditivo: {predictive.risk_level}</strong>
+            <p className="mt-1">{predictive.summary}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Mensagens */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        {messages.length === 0 && (
+          <p className="text-xs text-slate-500 text-center mt-8">
+            Pergunte sobre falhas, variações de OEE, ciclo do robô ou aguarde um diagnóstico automático de alarme.
+          </p>
+        )}
+        {messages.map((m, i) => (
+          <div
+            key={i}
+            className={`p-3 rounded-xl text-xs whitespace-pre-wrap leading-relaxed ${
+              m.role === "user"
+                ? "bg-indigo-600 text-white ml-8"
+                : m.role === "alarm"
+                ? "bg-red-950/60 border border-red-700 text-red-100"
+                : "bg-slate-900 border border-slate-800 text-slate-200 mr-4"
+            }`}
+          >
+            {m.role === "alarm" && <ShieldAlert className="inline mr-1.5 text-red-400" size={14} />}
+            {m.text}
+          </div>
+        ))}
+        {loading && <p className="text-xs text-indigo-400 animate-pulse">Consultando TimescaleDB e Redis...</p>}
+      </div>
+
+      {/* Input */}
+      <div className="p-3 border-t border-slate-800 flex gap-2 bg-slate-900">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+          placeholder="Pergunte ao Copiloto NexPulse..."
+          className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
+        />
+        <button
+          onClick={() => sendMessage()}
+          className="bg-indigo-600 hover:bg-indigo-500 text-white px-3 rounded-lg flex items-center"
+        >
+          <Send size={15} />
+        </button>
+      </div>
+    </div>
+  );
+};
+src/App.tsx (Painel Principal Integrado)
+Tsx
+import React, { useCallback, useEffect, useState } from "react";
+import { Bot, AlertTriangle, Wifi, WifiOff } from "lucide-react";
+import { useLineWebSocket } from "./hooks/useLineWebSocket";
+import { PalletVisualizer } from "./components/PalletVisualizer";
+import { DowntimeOneClickCard } from "./components/DowntimeOneClickCard";
+import { NexPulseCopilotDrawer } from "./components/NexPulseCopilotDrawer";
+import { DowntimeItem, OEEMetrics } from "./types/nexpulse";
+
+const LINE_ID = "PAL-01";
+const API_URL = "http://localhost:8000";
+
+export default function App() {
+  const { snapshot, wsStatus } = useLineWebSocket(LINE_ID, "ws://localhost:8000");
+  const [oee, setOee] = useState<OEEMetrics | null>(null);
+  const [downtimes, setDowntimes] = useState<DowntimeItem[]>([]);
+  const [copilotOpen, setCopilotOpen] = useState(false);
+
+  const loadAnalytics = useCallback(async () => {
+    try {
+      const [oeeRes, dtRes] = await Promise.all([
+        fetch(`${API_URL}/api/v1/lines/${LINE_ID}/oee?hours=8`),
+        fetch(`${API_URL}/api/v1/lines/${LINE_ID}/downtimes?only_unjustified=true`),
+      ]);
+      if (oeeRes.ok) setOee(await oeeRes.json());
+      if (dtRes.ok) setDowntimes(await dtRes.json());
+    } catch (err) {
+      console.error("Erro ao atualizar indicadores:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadAnalytics();
+    const id = window.setInterval(loadAnalytics, 10000);
+    return () => window.clearInterval(id);
+  }, [loadAnalytics]);
+
+  // Abre o Copiloto automaticamente se houver alarme crítico ativo
+  useEffect(() => {
+    if (snapshot && snapshot.alarm_code > 0) setCopilotOpen(true);
+  }, [snapshot?.alarm_code]);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-4 md:p-6">
+      {/* Cabeçalho */}
+      <header className="flex flex-wrap items-center justify-between gap-4 pb-5 mb-6 border-b border-slate-800">
+        <div>
+          <h1 className="text-xl font-bold tracking-tight">NexPulse Portal • Monitoramento de Paletização</h1>
+          <p className="text-xs text-slate-400 mt-0.5">Célula {LINE_ID} • Tempo Real via OPC UA / MQTT / WebSocket</p>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <span className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border ${
+            wsStatus === "ONLINE"
+              ? "border-emerald-700 bg-emerald-950/40 text-emerald-300"
+              : "border-red-700 bg-red-950/40 text-red-300"
+          }`}>
+            {wsStatus === "ONLINE" ? <Wifi size={14} /> : <WifiOff size={14} />}
+            {wsStatus}
+          </span>
+
+          <button
+            onClick={() => setCopilotOpen(true)}
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold px-4 py-2 rounded-lg shadow"
+          >
+            <Bot size={16} /> Copiloto IA
+          </button>
+        </div>
+      </header>
+
+      {/* Banner de Alarme Ativo */}
+      {snapshot && snapshot.alarm_code > 0 && (
+        <div className="mb-6 bg-red-950/70 border border-red-600 rounded-xl p-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <AlertTriangle className="text-red-400 shrink-0" size={24} />
+            <div>
+              <p className="text-sm font-bold text-red-100">
+                ALARME ATIVO #{snapshot.alarm_code}: {snapshot.alarm_description || "Falha na célula"}
+              </p>
+              <p className="text-xs text-red-300">O Agente NexPulse iniciou o diagnóstico guiado no painel lateral.</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setCopilotOpen(true)}
+            className="text-xs bg-red-600 hover:bg-red-500 text-white font-semibold px-3 py-1.5 rounded-lg"
+          >
+            Ver Diagnóstico
+          </button>
+        </div>
+      )}
+
+      {/* KPIs do Turno */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <p className="text-xs text-slate-400">Caixas no Turno</p>
+          <p className="text-2xl font-bold mt-1">{snapshot?.boxes_shift ?? "--"}</p>
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <p className="text-xs text-slate-400">Paletes Concluídos</p>
+          <p className="text-2xl font-bold mt-1">{snapshot?.completed_pallets ?? "--"}</p>
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <p className="text-xs text-slate-400">OEE Turno (8h)</p>
+          <p className="text-2xl font-bold text-sky-400 mt-1">{oee ? `${oee.oee}%` : "--"}</p>
+          {oee && (
+            <p className="text-[11px] text-slate-500 mt-1">
+              D:{oee.availability}% • P:{oee.performance}% • Q:{oee.quality}%
+            </p>
+          )}
+        </div>
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <p className="text-xs text-slate-400">Tempo Parado (8h)</p>
+          <p className="text-2xl font-bold text-amber-400 mt-1">{oee ? `${oee.downtime_sec}s` : "--"}</p>
+        </div>
+      </div>
+
+      {/* Sinótico + Formação do Palete */}
+      {snapshot ? (
+        <div className="mb-6">
+          <PalletVisualizer data={snapshot} />
+        </div>
+      ) : (
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-8 text-center text-slate-400 mb-6">
+          Aguardando telemetria em tempo real da célula {LINE_ID}...
+        </div>
+      )}
+
+      {/* Paradas com Classificação 1-Clique */}
+      <DowntimeOneClickCard
+        lineId={LINE_ID}
+        downtimes={downtimes}
+        apiBaseUrl={API_URL}
+        onJustified={loadAnalytics}
+      />
+
+      {/* Drawer do Copiloto NexPulse */}
+      <NexPulseCopilotDrawer
+        lineId={LINE_ID}
+        apiBaseUrl={API_URL}
+        snapshot={snapshot}
+        isOpen={copilotOpen}
+        onClose={() => setCopilotOpen(false)}
+      />
+    </div>
+  );
+}

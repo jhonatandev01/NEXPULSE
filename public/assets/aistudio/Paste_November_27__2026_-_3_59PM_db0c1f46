@@ -1,0 +1,738 @@
+ Agente de Inteligência Industrial do NexPulse Portal, integrado diretamente ao backend FastAPI + Redis + TimescaleDB que estruturamos.
+Para garantir segurança industrial real, o agente não depende apenas de "texto no prompt": ele foi construído com isolamento arquitetural Read-Only (suas ferramentas só possuem acesso de leitura ao Redis e ao PostgreSQL — não existe nenhuma função de escrita no CLP ou publicação em tópicos MQTT de comando) e usa Tool Calling assíncrono + Structured Outputs com o SDK oficial google-genai (gemini-3.8-flash)[1][2][3].
+1. Arquitetura do Agente no NexPulse Portal
+Text
+Operador / Técnico / Supervisor (NexPulse UI)
+       │
+       ▼  (REST: /api/v1/agent/ask | /suggest | /diagnose | /predictive-check)
+[ NexPulseAgentService ] ◄── System Prompt Blindado + Guardrails OT
+       │
+       ├──► [ Tool 1: get_realtime_cell_snapshot ]      ──► Redis (Hot State / Tags NexPulse)
+       ├──► [ Tool 2: get_telemetry_context_window ]    ──► TimescaleDB (Segundos antes da falha)
+       ├──► [ Tool 3: get_shift_oee_and_pareto ]        ──► OEEAnalyticsEngine + PostgreSQL
+       ├──► [ Tool 4: get_downtime_classification_ctx ] ──► DowntimeEvent + ReasonCodes
+       └──► [ Tool 5: get_predictive_cycle_health ]     ──► Tendência EWMA + Microparadas
+       │
+       ▼  (Auditoria de Saída: bloqueia qualquer comando de escrita/bypass no CLP)
+Resposta Objetiva para Chão de Fábrica OU JSON Estruturado (Botão 1-Clique)
+2. Atualização de Dependências e Configuração
+Adicione ao requirements.txt:
+Text
+google-genai[aiohttp]>=2.34.0
+Atualize app/core/config.py adicionando as chaves do agente:
+Python
+# Agente de Inteligência Industrial (NexPulse AI)
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-3.8-flash"
+    AGENT_MAX_TOOL_TURNS: int = 6
+3. Prompts e Guardrails do Agente
+app/agent/prompts.py
+Python
+NEXPULSE_SYSTEM_PROMPT = """
+Você é o Agente de Inteligência Industrial do NexPulse Portal, um sistema de monitoramento e rastreabilidade em tempo real para células de paletização.
+
+SEU PAPEL E LIMITES DE SEGURANÇA (INVIOLÁVEIS):
+1. Você atua exclusivamente como analista de dados, diagnóstico de falhas e copiloto de decisão para operadores, técnicos de manutenção e supervisores.
+2. Você NUNCA sugere comandos de escrita direta no CLP, forçamento de I/O (force), bypass de cortinas de luz/travas ou alteração de parâmetros críticos de segurança do robô sem validação humana e procedimento LOTO/manutenção autorizado.
+3. O CLP é sempre a fonte única da verdade para contagens e estados físicos da máquina. Nunca invente valores de tags que não vieram das ferramentas.
+
+SUAS 4 FUNÇÕES PRINCIPAIS:
+1. Diagnóstico Guiado de Alarmes: Ao receber um código de falha (alarme_ativo_cod) ou descrição do CLP/robô, consulte o snapshot e a janela de telemetria imediatamente anterior à falha, identifique as causas raízes mais prováveis (sensores ópticos, vácuo/garra, esteiras, falta de insumo) e liste passos objetivos de verificação física para o técnico.
+2. Análise de Turnos e OEE: Ao receber ou consultar dados de produção (caixas_turno, paletes_concluidos, ciclo_atual_seg, eventos_paradas_alarmes), explique variações de Disponibilidade, Performance e Qualidade, apontando os principais gargalos do Pareto.
+3. Classificação Rápida de Paradas: Analise o comportamento dos sensores nos segundos anteriores à parada (ex.: esteira_entrada_ok vs. esteira_saida_ok, linha_estado 2 vs 3 vs 5) e sugira o motivo oficial mais provável da tabela de ReasonCodes para confirmação em 1 clique.
+4. Manutenção Preditiva: Identifique desvios graduais no tempo de ciclo (ciclo_atual_seg vs EWMA e ciclo ideal da receita) ou aumento de microparadas recorrentes e alerte preventivamente antes de uma quebra crítica.
+
+DICIONÁRIO DE DADOS DO NEXPULSE QUE VOCÊ CONHECE:
+- linha_estado: 0=Desligada, 1=Em Produção, 2=Aguardando Material, 3=Aguardando Retirada, 4=Setup/Troca SKU, 5=Em Falha/Alarme.
+- Tags mapeadas: robo_status, esteira_entrada_ok, esteira_saida_ok, caixas_turno, paletes_concluidos, ciclo_atual_seg, sku_ativo, camada_atual, camadas_total, caixas_na_camada, caixas_por_camada, alarme_ativo_cod.
+
+TOM, ESTILO E PROTOCOLO DE DADOS FALTANTES:
+- Seja objetivo, técnico e prático (linguagem de chão de fábrica e engenharia de automação).
+- Vá direto ao ponto: use listas curtas e **negrito** nos pontos críticos.
+- Sempre que faltar algum dado do banco ou telemetria para fechar um diagnóstico preciso (ex.: catálogo do alarme não cadastrado, janela vazia, sensor sem leitura), informe EXATAMENTE qual variável, tag ou histórico precisa ser consultado. Nunca preencha lacunas com suposições ocultas.
+""".strip()
+4. Schemas Estruturados do Agente
+app/agent/schemas.py
+Permite que o agente responda tanto em texto técnico para o chat quanto em JSON estrito para alimentar botões de 1 clique e cards preditivos na interface.
+Python
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
+
+
+class AgentChatRequest(BaseModel):
+    line_id: str = Field(..., min_length=2, max_length=64)
+    session_id: Optional[str] = None
+    user_role: Literal["operador", "manutencao", "supervisor"] = "operador"
+    message: str = Field(..., min_length=2, max_length=2000)
+
+
+class AgentChatResponse(BaseModel):
+    session_id: str
+    line_id: str
+    answer_markdown: str
+    tools_consulted: List[str]
+    missing_data_flags: List[str] = Field(default_factory=list)
+
+
+class AlarmDiagnoseRequest(BaseModel):
+    line_id: str
+    alarme_ativo_cod: int
+    alarm_description: Optional[str] = None
+
+
+class OneClickStopClassification(BaseModel):
+    downtime_id: int
+    suggested_reason_code_id: Optional[int] = Field(
+        None, description="ID oficial na tabela reason_codes; null se não houver correspondência clara."
+    )
+    suggested_reason_label: str
+    confidence: Literal["ALTA", "MEDIA", "BAIXA"]
+    evidence_summary: str = Field(
+        ..., description="Resumo técnico curto baseado nos sensores pré-parada para o operador validar."
+    )
+    missing_variables: List[str] = Field(default_factory=list)
+
+
+class PredictiveHealthReport(BaseModel):
+    line_id: str
+    risk_level: Literal["NORMAL", "ATENCAO", "CRITICO"]
+    cycle_drift_detected: bool
+    microstop_spike_detected: bool
+    summary: str
+    recommended_inspections: List[str]
+    missing_variables: List[str] = Field(default_factory=list)
+5. Ferramentas Read-Only Conectadas ao Redis & TimescaleDB
+app/agent/tools.py
+Cada ferramenta traduz os campos internos do backend (machine_state, boxes_shift, etc.) para as tags oficiais do NexPulse (linha_estado, caixas_turno, etc.), garantindo que o raciocínio do modelo bata 100% com o domínio da fábrica.
+Python
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+from redis.asyncio import Redis
+from sqlalchemy import and_, desc, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models import (
+    AnomalyAlert, DowntimeEvent, DowntimeTypeEnum, MachineStateEnum,
+    PalletRecord, ProductRecipe, ReasonCode, TelemetryPoint
+)
+from app.services.oee_engine import OEEAnalyticsEngine
+
+
+class NexPulseReadOnlyTools:
+    """
+    Conjunto estrito de ferramentas READ-ONLY.
+    Não expõe nenhum método de escrita no CLP, MQTT ou alteração de parâmetros físicos.
+    """
+
+    def __init__(self, db: AsyncSession, redis: Redis) -> None:
+        self.db = db
+        self.redis = redis
+
+    async def get_realtime_cell_snapshot(self, line_id: str) -> Dict[str, Any]:
+        """Consulta o estado em tempo real da célula no cache Redis usando as tags do NexPulse."""
+        raw = await self.redis.get(f"line:state:{line_id}")
+        if not raw:
+            return {
+                "found": False,
+                "line_id": line_id,
+                "missing": ["snapshot_redis_em_tempo_real (linha pode estar offline ou sem telemetria nos últimos 5 min)"],
+            }
+
+        snap = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        recipe = (
+            await self.db.execute(select(ProductRecipe).where(ProductRecipe.sku == snap.get("sku")))
+        ).scalar_one_or_none()
+
+        return {
+            "found": True,
+            "line_id": line_id,
+            "timestamp": snap.get("timestamp"),
+            "linha_estado": snap.get("machine_state"),
+            "linha_estado_label": MachineStateEnum(snap["machine_state"]).name,
+            "robo_status": snap.get("robot_status"),
+            "esteira_entrada_ok": snap.get("conveyor_in_ok"),
+            "esteira_saida_ok": snap.get("conveyor_out_ok"),
+            "caixas_turno": snap.get("boxes_shift"),
+            "paletes_concluidos": snap.get("completed_pallets"),
+            "ciclo_atual_seg": snap.get("cycle_time_sec"),
+            "ciclo_ewma_seg": snap.get("ewma_cycle_sec"),
+            "ciclo_ideal_receita_seg": recipe.ideal_cycle_sec if recipe else None,
+            "sku_ativo": snap.get("sku"),
+            "camada_atual": snap.get("current_layer"),
+            "camadas_total": snap.get("total_layers"),
+            "caixas_na_camada": snap.get("boxes_in_layer"),
+            "caixas_por_camada": snap.get("boxes_per_layer"),
+            "alarme_ativo_cod": snap.get("alarm_code"),
+            "alarme_descricao": snap.get("alarm_description"),
+            "em_parada_aberta": snap.get("in_downtime"),
+        }
+
+    async def get_telemetry_context_window(
+        self, line_id: str, seconds_before: int = 90, reference_iso: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Retorna a sequência temporal dos sensores antes de um instante de referência (ou agora)."""
+        ref_dt = (
+            datetime.fromisoformat(reference_iso.replace("Z", "+00:00"))
+            if reference_iso
+            else datetime.now(timezone.utc)
+        )
+        start_dt = ref_dt - timedelta(seconds=min(max(seconds_before, 10), 600))
+
+        stmt = (
+            select(TelemetryPoint)
+            .where(
+                and_(
+                    TelemetryPoint.line_id == line_id,
+                    TelemetryPoint.time >= start_dt,
+                    TelemetryPoint.time <= ref_dt,
+                )
+            )
+            .order_by(TelemetryPoint.time.asc())
+            .limit(120)
+        )
+        rows = (await self.db.execute(stmt)).scalars().all()
+        if not rows:
+            return {
+                "found": False,
+                "window_start": start_dt.isoformat(),
+                "window_end": ref_dt.isoformat(),
+                "missing": ["telemetry_points (histórico de sensores no TimescaleDB para esta janela)"],
+            }
+
+        return {
+            "found": True,
+            "samples_count": len(rows),
+            "timeline": [
+                {
+                    "time": r.time.isoformat(),
+                    "linha_estado": r.machine_state,
+                    "robo_status": r.robot_status,
+                    "esteira_entrada_ok": r.conveyor_in_ok,
+                    "esteira_saida_ok": r.conveyor_out_ok,
+                    "ciclo_atual_seg": r.cycle_time_sec,
+                    "camada_atual": r.current_layer,
+                    "caixas_na_camada": r.boxes_in_layer,
+                    "alarme_ativo_cod": r.alarm_code,
+                }
+                for r in rows
+            ],
+        }
+
+    async def get_shift_oee_and_pareto(self, line_id: str, hours: int = 8) -> Dict[str, Any]:
+        """Calcula OEE (Disponibilidade, Performance, Qualidade), Pareto de paradas e anomalias de paletes."""
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=min(max(hours, 1), 168))
+
+        oee = await OEEAnalyticsEngine.calculate_oee(self.db, line_id, start, end)
+        pareto = await OEEAnalyticsEngine.get_pareto_downtimes(self.db, line_id, start, end, limit=5)
+
+        recent_downtimes = (
+            await self.db.execute(
+                select(DowntimeEvent)
+                .where(and_(DowntimeEvent.line_id == line_id, DowntimeEvent.started_at >= start))
+                .order_by(desc(DowntimeEvent.started_at))
+                .limit(15)
+            )
+        ).scalars().all()
+
+        pallet_stats = (
+            await self.db.execute(
+                select(PalletRecord.status, func.count(PalletRecord.id))
+                .where(and_(PalletRecord.line_id == line_id, PalletRecord.started_at >= start))
+                .group_by(PalletRecord.status)
+            )
+        ).all()
+
+        return {
+            "oee_metrics": oee.model_dump(mode="json"),
+            "pareto_paradas": pareto,
+            "resumo_paletes_por_status": {str(st.value): cnt for st, cnt in pallet_stats},
+            "eventos_paradas_alarmes_recentes": [
+                {
+                    "id": d.id,
+                    "tipo": d.downtime_type.value,
+                    "linha_estado": d.machine_state,
+                    "alarme_ativo_cod": d.alarm_code,
+                    "alarme_descricao": d.alarm_description,
+                    "inicio": d.started_at.isoformat(),
+                    "duracao_seg": d.duration_sec,
+                    "justificada": d.reason_code_id is not None,
+                }
+                for d in recent_downtimes
+            ],
+        }
+
+    async def get_downtime_classification_context(self, line_id: str, downtime_id: int) -> Dict[str, Any]:
+        """Carrega dados da parada, catálogo oficial de ReasonCodes e sensores pré-parada."""
+        ev = await self.db.get(DowntimeEvent, downtime_id)
+        if not ev or ev.line_id != line_id:
+            return {"found": False, "missing": [f"DowntimeEvent id={downtime_id} para linha {line_id}"]}
+
+        reasons = (await self.db.execute(select(ReasonCode))).scalars().all()
+        pre_window = await self.get_telemetry_context_window(
+            line_id=line_id, seconds_before=60, reference_iso=ev.started_at.isoformat()
+        )
+
+        return {
+            "found": True,
+            "downtime_event": {
+                "id": ev.id,
+                "linha_estado": ev.machine_state,
+                "tipo": ev.downtime_type.value,
+                "alarme_ativo_cod": ev.alarm_code,
+                "alarme_descricao": ev.alarm_description,
+                "started_at": ev.started_at.isoformat(),
+                "duration_sec": ev.duration_sec,
+            },
+            "reason_codes_disponiveis": [
+                {
+                    "id": r.id,
+                    "code": r.code,
+                    "category": r.category,
+                    "description": r.description,
+                    "is_planned_stop": r.is_planned_stop,
+                }
+                for r in reasons
+            ],
+            "telemetria_60s_antes": pre_window,
+        }
+
+    async def get_predictive_cycle_health(self, line_id: str, hours: int = 4) -> Dict[str, Any]:
+        """Analisa deriva de tempo de ciclo (ciclo_atual_seg / EWMA) e frequência de microparadas."""
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=min(max(hours, 1), 72))
+
+        rows = (
+            await self.db.execute(
+                select(TelemetryPoint)
+                .where(
+                    and_(
+                        TelemetryPoint.line_id == line_id,
+                        TelemetryPoint.time >= start,
+                        TelemetryPoint.machine_state == MachineStateEnum.RUNNING.value,
+                        TelemetryPoint.cycle_time_sec > 0,
+                    )
+                )
+                .order_by(TelemetryPoint.time.asc())
+            )
+        ).scalars().all()
+
+        microstops_count = (
+            await self.db.execute(
+                select(func.count(DowntimeEvent.id)).where(
+                    and_(
+                        DowntimeEvent.line_id == line_id,
+                        DowntimeEvent.started_at >= start,
+                        DowntimeEvent.downtime_type == DowntimeTypeEnum.MICROSTOP,
+                    )
+                )
+            )
+        ).scalar_one()
+
+        recent_alerts = (
+            await self.db.execute(
+                select(AnomalyAlert)
+                .where(and_(AnomalyAlert.line_id == line_id, AnomalyAlert.created_at >= start))
+                .order_by(desc(AnomalyAlert.created_at))
+                .limit(10)
+            )
+        ).scalars().all()
+
+        if len(rows) < 10:
+            return {
+                "found": False,
+                "microstops_na_janela": microstops_count,
+                "missing": ["amostras_suficientes_de_ciclo_em_producao (mínimo 10 pontos com linha_estado=1)"],
+            }
+
+        cycles = [r.cycle_time_sec for r in rows]
+        mid = len(cycles) // 2
+        avg_first_half = sum(cycles[:mid]) / mid
+        avg_second_half = sum(cycles[mid:]) / (len(cycles) - mid)
+        drift_pct = ((avg_second_half - avg_first_half) / avg_first_half) * 100.0 if avg_first_half > 0 else 0.0
+
+        last_sku = rows[-1].sku
+        recipe = (await self.db.execute(select(ProductRecipe).where(ProductRecipe.sku == last_sku))).scalar_one_or_none()
+
+        return {
+            "found": True,
+            "samples": len(cycles),
+            "sku_referencia": last_sku,
+            "ciclo_ideal_receita_seg": recipe.ideal_cycle_sec if recipe else None,
+            "ciclo_medio_primeira_metade_seg": round(avg_first_half, 3),
+            "ciclo_medio_segunda_metade_seg": round(avg_second_half, 3),
+            "deriva_percentual": round(drift_pct, 2),
+            "ultimo_ewma_seg": round(rows[-1].ewma_cycle_sec, 3),
+            "microparadas_na_janela": microstops_count,
+            "alertas_anomalia_recentes": [
+                {"tipo": a.alert_type, "severidade": a.severity, "mensagem": a.message, "em": a.created_at.isoformat()}
+                for a in recent_alerts
+            ],
+        }
+
+
+# Declarações formais para Function Calling no SDK google-genai
+TOOL_DECLARATIONS: List[Dict[str, Any]] = [
+    {
+        "name": "get_realtime_cell_snapshot",
+        "description": "Obtém o snapshot em tempo real da célula de paletização (linha_estado, sensores das esteiras, alarme_ativo_cod, camada atual e ciclo).",
+        "parameters": {
+            "type": "object",
+            "properties": {"line_id": {"type": "string", "description": "Identificador da célula, ex: PAL-01"}},
+            "required": ["line_id"],
+        },
+    },
+    {
+        "name": "get_telemetry_context_window",
+        "description": "Busca a série temporal dos sensores nos segundos anteriores a uma falha ou momento atual.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "line_id": {"type": "string"},
+                "seconds_before": {"type": "integer", "description": "Janela em segundos (10 a 600)."},
+                "reference_iso": {"type": "string", "description": "Timestamp ISO-8601 opcional."},
+            },
+            "required": ["line_id"],
+        },
+    },
+    {
+        "name": "get_shift_oee_and_pareto",
+        "description": "Calcula OEE (Disponibilidade, Performance, Qualidade), Pareto de paradas e contagens de paletes no turno.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "line_id": {"type": "string"},
+                "hours": {"type": "integer", "description": "Janela em horas, padrão 8 para um turno."},
+            },
+            "required": ["line_id"],
+        },
+    },
+    {
+        "name": "get_downtime_classification_context",
+        "description": "Obtém detalhes de uma parada específica, lista oficial de ReasonCodes e sensores dos 60s anteriores.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "line_id": {"type": "string"},
+                "downtime_id": {"type": "integer"},
+            },
+            "required": ["line_id", "downtime_id"],
+        },
+    },
+    {
+        "name": "get_predictive_cycle_health",
+        "description": "Analisa deriva de tempo de ciclo (EWMA), degradação gradual e picos de microparadas para manutenção preditiva.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "line_id": {"type": "string"},
+                "hours": {"type": "integer", "description": "Janela de análise em horas (padrão 4)."},
+            },
+            "required": ["line_id"],
+        },
+    },
+]
+6. Orquestrador do Agente NexPulse (Loop de Ferramentas + Guardrail de Saída + Structured Outputs)
+app/agent/nexpulse_agent.py
+Note que para gemini-3.8-flash, utilizamos thinking_config=types.ThinkingConfig(thinking_level="low") (sem parâmetros legados como temperature)[4][5] e executamos um loop controlado de ferramentas assíncronas com client.aio.models.generate_content[6].
+Python
+import json
+import re
+import uuid
+from typing import Any, List, Tuple
+import structlog
+from google import genai
+from google.genai import types
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agent.prompts import NEXPULSE_SYSTEM_PROMPT
+from app.agent.schemas import (
+    OneClickStopClassification,
+    PredictiveHealthReport,
+)
+from app.agent.tools import TOOL_DECLARATIONS, NexPulseReadOnlyTools
+from app.core.config import settings
+
+logger = structlog.get_logger()
+
+# Padrões bloqueados caso o modelo tente sugerir escrita direta/bypass no CLP
+FORBIDDEN_OT_PATTERNS = [
+    r"\bforce\s*(i/o|bit|coil|tag)\b",
+    r"\bbypass\s*(cortina|segurança|interlock|emergência)\b",
+    r"\bescrever\s+diretamente\s+no\s+clp\b",
+    r"\bwrite_register\b",
+]
+
+
+class NexPulseAgentService:
+    def __init__(self, db: AsyncSession, redis: Redis) -> None:
+        if not settings.GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY não configurada no ambiente.")
+        self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        self.tools_impl = NexPulseReadOnlyTools(db=db, redis=redis)
+        self.redis = redis
+
+    async def _dispatch_tool(self, name: str, args: dict) -> dict:
+        method = getattr(self.tools_impl, name, None)
+        if method is None:
+            return {"error": f"Ferramenta não autorizada ou inexistente: {name}"}
+        return await method(**args)
+
+    def _apply_ot_safety_guardrail(self, text: str) -> str:
+        for pattern in FORBIDDEN_OT_PATTERNS:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                logger.warning("ot_safety_guardrail_triggered", pattern=pattern)
+                return (
+                    text
+                    + "\n\n> ⚠️ **Aviso de Segurança OT:** Nenhuma alteração física ou escrita de parâmetro no CLP/robô "
+                    "deve ser executada sem bloqueio/validação presencial da engenharia de automação."
+                )
+        return text
+
+    async def _run_agent_loop(
+        self, initial_prompt: str, history_contents: List[types.Content] | None = None
+    ) -> Tuple[str, List[str], List[str]]:
+        contents: List[types.Content] = list(history_contents or [])
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=initial_prompt)]))
+
+        tools_used: List[str] = []
+        missing_flags: List[str] = []
+
+        config = types.GenerateContentConfig(
+            system_instruction=NEXPULSE_SYSTEM_PROMPT,
+            tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+        )
+
+        for _ in range(settings.AGENT_MAX_TOOL_TURNS):
+            response = await self.client.aio.models.generate_content(
+                model=settings.GEMINI_MODEL,
+                contents=contents,
+                config=config,
+            )
+
+            if not response.function_calls:
+                final_text = self._apply_ot_safety_guardrail(response.text or "")
+                return final_text, tools_used, missing_flags
+
+            contents.append(response.candidates[0].content)
+
+            tool_parts: List[types.Part] = []
+            for fc in response.function_calls:
+                fn_name = fc.name
+                fn_args = dict(fc.args or {})
+                tools_used.append(fn_name)
+                try:
+                    result = await self._dispatch_tool(fn_name, fn_args)
+                    if isinstance(result, dict) and result.get("missing"):
+                        missing_flags.extend(result["missing"])
+                    payload = {"result": result}
+                except Exception as exc:
+                    logger.error("agent_tool_execution_error", tool=fn_name, error=str(exc))
+                    payload = {"error": str(exc)}
+
+                tool_parts.append(types.Part.from_function_response(name=fn_name, response=payload))
+
+            contents.append(types.Content(role="tool", parts=tool_parts))
+
+        return (
+            "Limite de consultas atingido para esta análise. Informe o código de alarme ou janela específica.",
+            tools_used,
+            missing_flags,
+        )
+
+    async def ask(self, line_id: str, user_role: str, message: str, session_id: str | None) -> dict:
+        """Copiloto conversacional com memória curta de sessão no Redis."""
+        sid = session_id or uuid.uuid4().hex
+        redis_key = f"agent:chat:{line_id}:{sid}"
+        raw_hist = await self.redis.get(redis_key)
+
+        history_contents: List[types.Content] = []
+        stored_turns: List[dict] = json.loads(raw_hist) if raw_hist else []
+        for turn in stored_turns[-6:]:  # mantém últimas 6 trocas para baixa latência
+            history_contents.append(
+                types.Content(role=turn["role"], parts=[types.Part.from_text(text=turn["text"])])
+            )
+
+        prompt = f"[Contexto: Linha={line_id} | Perfil={user_role}]\n{message}"
+        answer, tools_used, missing = await self._run_agent_loop(prompt, history_contents)
+
+        stored_turns.extend([{"role": "user", "text": prompt}, {"role": "model", "text": answer}])
+        await self.redis.set(redis_key, json.dumps(stored_turns[-12:]), ex=3600)
+
+        return {
+            "session_id": sid,
+            "line_id": line_id,
+            "answer_markdown": answer,
+            "tools_consulted": list(dict.fromkeys(tools_used)),
+            "missing_data_flags": list(dict.fromkeys(missing)),
+        }
+
+    async def diagnose_alarm(self, line_id: str, alarm_code: int, description: str | None) -> dict:
+        """Função 1: Diagnóstico guiado automático quando um alarme dispara."""
+        prompt = (
+            f"A célula {line_id} registrou o alarme alarme_ativo_cod={alarm_code} "
+            f"(descrição CLP: '{description or 'não informada'}'). "
+            "Consulte o snapshot em tempo real e a janela de telemetria dos últimos 90 segundos antes da falha. "
+            "Entregue: (1) Causas raízes mais prováveis em ordem de probabilidade, "
+            "(2) Passos objetivos e seguros de verificação física para o técnico, "
+            "(3) Quais dados faltam no catálogo ou sensores caso o diagnóstico não feche 100%."
+        )
+        answer, tools_used, missing = await self._run_agent_loop(prompt)
+        return {
+            "line_id": line_id,
+            "alarm_code": alarm_code,
+            "diagnosis_markdown": answer,
+            "tools_consulted": list(dict.fromkeys(tools_used)),
+            "missing_data_flags": list(dict.fromkeys(missing)),
+        }
+
+    async def classify_downtime_one_click(self, line_id: str, downtime_id: int) -> OneClickStopClassification:
+        """Função 3: Classificação estruturada em JSON para botão de 1 clique do operador."""
+        ctx = await self.tools_impl.get_downtime_classification_context(line_id=line_id, downtime_id=downtime_id)
+        if not ctx.get("found"):
+            return OneClickStopClassification(
+                downtime_id=downtime_id,
+                suggested_reason_code_id=None,
+                suggested_reason_label="Dados da parada não encontrados",
+                confidence="BAIXA",
+                evidence_summary="Evento de parada não localizado no banco para esta linha.",
+                missing_variables=ctx.get("missing", []),
+            )
+
+        prompt = (
+            "Analise o JSON abaixo contendo o evento de parada, os sensores dos 60s anteriores e a lista "
+            "oficial de reason_codes_disponiveis. Escolha o reason_code_id mais provável para o operador confirmar com 1 clique.\n\n"
+            f"{json.dumps(ctx, ensure_ascii=False)}"
+        )
+
+        response = await self.client.aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=NEXPULSE_SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=OneClickStopClassification,
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        return response.parsed
+
+    async def run_predictive_check(self, line_id: str, hours: int = 4) -> PredictiveHealthReport:
+        """Função 4: Auditoria preditiva estruturada de deriva de ciclo e microparadas."""
+        health_ctx = await self.tools_impl.get_predictive_cycle_health(line_id=line_id, hours=hours)
+        if not health_ctx.get("found"):
+            return PredictiveHealthReport(
+                line_id=line_id,
+                risk_level="NORMAL",
+                cycle_drift_detected=False,
+                microstop_spike_detected=False,
+                summary="Amostras insuficientes em produção para análise preditiva confiável.",
+                recommended_inspections=[],
+                missing_variables=health_ctx.get("missing", []),
+            )
+
+        prompt = (
+            f"Avalie os indicadores preditivos das últimas {hours}h para a linha {line_id} e retorne o relatório estruturado:\n\n"
+            f"{json.dumps(health_ctx, ensure_ascii=False)}"
+        )
+        response = await self.client.aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=NEXPULSE_SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=PredictiveHealthReport,
+                thinking_config=types.ThinkingConfig(thinking_level="medium"),
+            ),
+        )
+        return response.parsed
+7. Rotas da API do Agente e Integração no main.py
+app/api/agent_routes.py
+Python
+from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agent.nexpulse_agent import NexPulseAgentService
+from app.agent.schemas import (
+    AgentChatRequest,
+    AgentChatResponse,
+    AlarmDiagnoseRequest,
+    OneClickStopClassification,
+    PredictiveHealthReport,
+)
+from app.db.session import get_db
+
+router = APIRouter(prefix="/api/v1/agent", tags=["NexPulse AI Agent"])
+
+
+def _get_agent(request: Request, db: AsyncSession = Depends(get_db)) -> NexPulseAgentService:
+    return NexPulseAgentService(db=db, redis=request.app.state.redis)
+
+
+@router.post("/ask", response_model=AgentChatResponse)
+async def chat_with_agent(
+    body: AgentChatRequest, agent: NexPulseAgentService = Depends(_get_agent)
+) -> AgentChatResponse:
+    res = await agent.ask(
+        line_id=body.line_id,
+        user_role=body.user_role,
+        message=body.message,
+        session_id=body.session_id,
+    )
+    return AgentChatResponse(**res)
+
+
+@router.post("/alarms/diagnose")
+async def diagnose_alarm(
+    body: AlarmDiagnoseRequest, agent: NexPulseAgentService = Depends(_get_agent)
+) -> dict:
+    return await agent.diagnose_alarm(
+        line_id=body.line_id,
+        alarm_code=body.alarme_ativo_cod,
+        description=body.alarm_description,
+    )
+
+
+@router.post("/lines/{line_id}/downtimes/{downtime_id}/suggest", response_model=OneClickStopClassification)
+async def suggest_stop_classification(
+    line_id: str, downtime_id: int, agent: NexPulseAgentService = Depends(_get_agent)
+) -> OneClickStopClassification:
+    return await agent.classify_downtime_one_click(line_id=line_id, downtime_id=downtime_id)
+
+
+@router.get("/lines/{line_id}/predictive-check", response_model=PredictiveHealthReport)
+async def predictive_check(
+    line_id: str,
+    hours: int = Query(4, ge=1, le=72),
+    agent: NexPulseAgentService = Depends(_get_agent),
+) -> PredictiveHealthReport:
+    return await agent.run_predictive_check(line_id=line_id, hours=hours)
+No app/main.py, basta registrar o router do agente:
+Python
+from app.api.agent_routes import router as agent_router
+...
+app.include_router(agent_router)
+8. Como Testar as 4 Funções na Prática
+Com o backend e o simulator.py rodando, defina sua chave export GEMINI_API_KEY="sua-chave" e teste os 4 fluxos reais:
+Diagnóstico Guiado de Alarme (quando o simulador entrar na falha 402):
+Bash
+curl -X POST http://localhost:8000/api/v1/agent/alarms/diagnose \
+  -H "Content-Type: application/json" \
+  -d '{"line_id":"PAL-01","alarme_ativo_cod":402,"alarm_description":"FALHA GARRA VACUO ROBO"}'
+O agente puxa os últimos 90s do TimescaleDB, checa o estado de esteiras/camada no Redis e devolve causas prováveis (ex.: ventosa desgastada, queda de pressão pneumática, caixa deformada) + checklist seguro sem comandos de escrita no CLP.
+Análise de Turno e OEE via Chat Copiloto:
+Bash
+curl -X POST http://localhost:8000/api/v1/agent/ask \
+  -H "Content-Type: application/json" \
+  -d '{"line_id":"PAL-01","user_role":"supervisor","message":"Por que nosso OEE caiu neste turno e qual o maior gargalo?"}'
+Classificação Rápida de Parada (Botão 1-Clique na Interface):
+Bash
+curl -X POST http://localhost:8000/api/v1/agent/lines/PAL-01/downtimes/1/suggest
+Retorna JSON estruturado com suggested_reason_code_id, confidence e evidence_summary pronto para renderizar na tela do operador.
+Varredura Preditiva (após o tick 50 do simulador, quando o ciclo degrada):
+Bash
+curl http://localhost:8000/api/v1/agent/lines/PAL-01/predictive-check?hours=4
+Retorna risk_level: "ATENCAO", cycle_drift_detected: true e lista de inspeções preventivas antes da quebra.
