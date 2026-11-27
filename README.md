@@ -10,7 +10,7 @@
 [![Gemini AI](https://img.shields.io/badge/Google%20GenAI-SDK-4285F4?style=for-the-badge&logo=google)]()
 [![Licença](https://img.shields.io/badge/license-Apache%202.0-orange?style=for-the-badge)]()
 
-<img src="public/assets/aistudio/nexpulse_logo_emblem_1795803460887.jpg" alt="NexPulse Logo" width="120" style="border-radius: 20px; margin: 20px 0;" />
+<img src="src/assets/images/nexpulse_logo_emblem_1795803460887.jpg" alt="NexPulse Logo" width="120" style="border-radius: 20px; margin: 20px 0;" />
 
 *Painel web interativo de alta fidelidade para chão de fábrica, integrando Gêmeo Digital 3D (Three.js), cálculo de OEE em tempo real, motor de simulação IIoT e Agente de Inteligência Industrial com isolamento Read-Only OT.*
 
@@ -31,7 +31,7 @@ O **NexPulse Portal** é uma solução de Supervisório HMI e IIoT desenvolvida 
 | **Frontend** | React 19, TypeScript, Tailwind CSS v4, Three.js (WebGL 3D), Lucide React, Motion |
 | **Backend & Tempo Real** | Node.js, Express, WebSocket (`/ws`) para sincronização instantânea de estado |
 | **Motor Industrial** | Lógica determinística de ciclos, cálculo de OEE (Disponibilidade, Desempenho, Qualidade), EWMA de tempo de ciclo e Pareto de paradas |
-| **Inteligência Artificial** | `@google/genai` (SDK oficial), Tool Calling assíncrono com ferramentas Read-Only e Structured Outputs (Pydantic/JSON Schema) |
+| **Inteligência Artificial** | `@google/genai` (SDK oficial), Tool Calling assíncrono com ferramentas Read-Only e Structured Outputs |
 | **Qualidade & Testes** | Node Test Runner (`node:test`), TypeScript (`tsc --noEmit`), Playwright E2E |
 
 ---
